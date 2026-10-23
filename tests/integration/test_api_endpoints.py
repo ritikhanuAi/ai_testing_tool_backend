@@ -58,7 +58,7 @@ def test_cors_preflight_for_nextjs():
 
 def test_validation_error_envelope():
     """Verify validation errors are wrapped in unified error envelope."""
-    response = client.post("/api/v1/accounts/register", json={})
+    response = client.post("/api/v1/websites", json={})
     assert response.status_code == 422
     payload = response.json()
     assert payload["success"] is False

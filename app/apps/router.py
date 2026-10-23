@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 from app.core.config import settings
-from app.apps.accounts.urls import router as accounts_router
+# from app.apps.accounts.urls import router as accounts_router  # Disabled for now
 from app.apps.websites.urls import router as websites_router
 from app.apps.scan_profiles.urls import router as profiles_router
 from app.apps.test_packs.urls import router as packs_router
@@ -13,7 +13,7 @@ from app.apps.health.urls import router as health_router
 api_v1_router = APIRouter(prefix="/api/v1")
 api_v1_router.include_router(health_router)
 api_v1_router.include_router(dashboard_router)
-api_v1_router.include_router(accounts_router)
+# api_v1_router.include_router(accounts_router)  # Disabled for now
 api_v1_router.include_router(websites_router)
 api_v1_router.include_router(profiles_router)
 api_v1_router.include_router(packs_router)
