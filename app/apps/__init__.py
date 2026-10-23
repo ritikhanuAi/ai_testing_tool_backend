@@ -1,0 +1,1 @@
+"""Domain apps package."""

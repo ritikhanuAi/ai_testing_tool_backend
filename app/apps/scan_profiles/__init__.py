@@ -1,0 +1,1 @@
+"""Scan profiles configuration app."""

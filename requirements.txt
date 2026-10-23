@@ -1,0 +1,35 @@
+# FastAPI Web & API Framework
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.9.0
+pydantic-settings>=2.6.0
+pydantic[email]>=2.9.0
+email-validator>=2.0.0
+python-multipart>=0.0.12
+
+# Database & Migrations
+sqlalchemy>=2.0.36
+alembic>=1.13.3
+asyncpg>=0.30.0
+psycopg2-binary>=2.9.10
+
+# Security & Credentials Encryption
+cryptography>=43.0.3
+passlib[bcrypt]>=1.7.4
+python-jose[cryptography]>=3.3.0
+
+# Browser Automation & Testing
+playwright>=1.48.0
+pyyaml>=6.0.2
+
+# Background Tasks & Job Queue
+celery[redis]>=5.4.0
+redis>=5.2.0
+
+# HTTP & AI Clients
+httpx>=0.27.2
+
+# Testing & Linting
+pytest>=8.3.3
+pytest-asyncio>=0.24.0
+pytest-cov>=6.0.0
