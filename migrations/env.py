@@ -10,6 +10,13 @@ sys.path.insert(0, os.path.realpath(os.path.join(os.path.dirname(__file__), '..'
 from app.core.config import settings
 from app.core.database import Base
 
+# Ensure all application models are loaded for Alembic autogeneration
+import app.apps.websites.models  # noqa
+import app.apps.scan_profiles.models  # noqa
+import app.apps.test_packs.models  # noqa
+import app.apps.test_runs.models  # noqa
+import app.apps.reports.models  # noqa
+
 config = context.config
 
 if config.config_file_name is not None:

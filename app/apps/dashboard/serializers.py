@@ -17,5 +17,5 @@ class RecentActivityItem(BaseSchema):
     target_url: str
     status: str
     score: Optional[float] = None
-    started_at: datetime
+    started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None

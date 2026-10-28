@@ -1,6 +1,6 @@
-from sqlalchemy import Column, String, Boolean, Enum as SQLEnum, JSON, ForeignKey, DateTime
+from sqlalchemy import Column, String, Boolean, Enum as SQLEnum, ForeignKey, DateTime, Text, UniqueConstraint
 from sqlalchemy.orm import relationship
-from app.common.models import BaseModel
+from app.common.models import BaseModel, JSONType
 from app.common.constants import TargetEnvironment, VerificationStatus
 
 class Website(BaseModel):
@@ -8,24 +8,29 @@ class Website(BaseModel):
 
     name = Column(String(255), nullable=False)
     base_url = Column(String(500), nullable=False)
-    environment = Column(SQLEnum(TargetEnvironment), default=TargetEnvironment.STAGING, nullable=False)
-    allowed_domains = Column(JSON, default=list, nullable=False)
+    environment = Column(SQLEnum(TargetEnvironment), default=TargetEnvironment.STAGING, nullable=False, index=True)
+    allowed_domains = Column(JSONType, default=list, nullable=False)
     is_authorized = Column(Boolean, default=True, nullable=False)
-    is_active = Column(Boolean, default=True, nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False, index=True)
     verification_token = Column(String(64), nullable=True)
     verification_status = Column(SQLEnum(VerificationStatus), default=VerificationStatus.PENDING, nullable=False)
-    verified_at = Column(DateTime, nullable=True)
+    verified_at = Column(DateTime(timezone=True), nullable=True)
 
     # Relationships
     credentials = relationship("CredentialRef", back_populates="website", cascade="all, delete-orphan")
+    test_packs = relationship("TestPack", back_populates="website", cascade="all, delete-orphan")
+    test_runs = relationship("TestRun", back_populates="website", cascade="all, delete-orphan")
 
 class CredentialRef(BaseModel):
     __tablename__ = "credentials"
+    __table_args__ = (
+        UniqueConstraint("website_id", "key_name", name="uq_credentials_website_key"),
+    )
 
-    website_id = Column(String(36), ForeignKey("websites.id"), nullable=False)
+    website_id = Column(String(36), ForeignKey("websites.id", ondelete="CASCADE"), nullable=False, index=True)
     key_name = Column(String(100), nullable=False)  # Reference name used in YAML test cases
     username = Column(String(255), nullable=True)
-    encrypted_secret = Column(String(1000), nullable=False)  # Fernet encrypted password / token
+    encrypted_secret = Column(Text, nullable=False)  # Fernet encrypted password / token
     description = Column(String(255), nullable=True)
 
     website = relationship("Website", back_populates="credentials")

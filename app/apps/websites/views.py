@@ -5,10 +5,20 @@ from app.core.database import get_db
 from app.common.serializers import ResponseEnvelope
 from app.apps.websites.serializers import (
     WebsiteCreateRequest, WebsiteResponse, CredentialCreateRequest, CredentialResponse,
-    WebsiteVerificationResponse
+    WebsiteVerificationResponse, WebsiteAnalyzeRequest, WebsiteAnalyzeResponse
 )
-from app.apps.websites.services import create_website, add_credential
+from app.apps.websites.services import create_website, add_credential, analyze_target_url
 from app.apps.websites.selectors import list_websites, get_website_by_id
+
+async def analyze_website_view(
+    data: WebsiteAnalyzeRequest
+) -> ResponseEnvelope[WebsiteAnalyzeResponse]:
+    """Probe website URL to determine testing requirements and recommended execution options."""
+    result = await analyze_target_url(data)
+    return ResponseEnvelope(
+        message="Website requirements analyzed successfully",
+        data=result
+    )
 
 async def list_websites_view(
     db: AsyncSession = Depends(get_db)

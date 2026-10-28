@@ -43,3 +43,44 @@ class CredentialResponse(BaseSchema):
     key_name: str
     username: Optional[str] = None
     description: Optional[str] = None
+
+class WebsiteAnalyzeRequest(BaseModel):
+    url: str = Field(..., description="Target website entry URL (e.g. https://example.com)")
+
+class CredentialRequirementInfo(BaseModel):
+    required: bool = False
+    auth_method: str = "none"  # "none", "form", "basic_auth"
+    detected_login_url: Optional[str] = None
+    detected_fields: List[str] = Field(default_factory=list)
+    guidance: str
+
+class RecommendedExecutionOptions(BaseModel):
+    check_functional: bool = True
+    check_security: bool = True
+    check_performance: bool = True
+    check_accessibility: bool = True
+    browser_type: str = "chromium"
+    viewport_width: int = 1280
+    viewport_height: int = 720
+    is_mobile: bool = False
+    allow_state_changing: bool = False
+    rate_limit_rps: int = 10
+    timeout_seconds: int = 300
+    max_crawl_depth: int = 2
+    use_ai_generation: bool = True
+    ai_test_goals: Optional[str] = None
+    ai_explain_failures: bool = True
+
+class WebsiteAnalyzeResponse(BaseSchema):
+    url: str
+    hostname: str
+    accessible: bool
+    status_code: Optional[int] = None
+    response_time_ms: Optional[float] = None
+    page_title: Optional[str] = None
+    is_public_website: bool
+    needs_credentials: bool
+    credentials_requirement: CredentialRequirementInfo
+    recommended_options: RecommendedExecutionOptions
+    ready_quick_scan_payload: dict
+

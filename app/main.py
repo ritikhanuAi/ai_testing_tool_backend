@@ -9,6 +9,13 @@ from app.core.exceptions import register_exception_handlers
 from app.core.database import engine, Base
 from app.apps.router import root_router
 
+# Ensure all models are registered on Base
+import app.apps.websites.models  # noqa
+import app.apps.scan_profiles.models  # noqa
+import app.apps.test_packs.models  # noqa
+import app.apps.test_runs.models  # noqa
+import app.apps.reports.models  # noqa
+
 # Setup logging immediately
 setup_logging()
 

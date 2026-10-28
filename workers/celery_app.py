@@ -1,6 +1,13 @@
 from celery import Celery
 from app.core.config import settings
 
+# Register all database models so mapper relationships resolve in Celery worker processes
+import app.apps.websites.models  # noqa
+import app.apps.scan_profiles.models  # noqa
+import app.apps.test_packs.models  # noqa
+import app.apps.test_runs.models  # noqa
+import app.apps.reports.models  # noqa
+
 celery_app = Celery(
     "ai_testing_workers",
     broker=settings.CELERY_BROKER_URL,

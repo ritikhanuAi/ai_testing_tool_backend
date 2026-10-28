@@ -40,15 +40,16 @@ async def get_recent_activity(db: AsyncSession, limit: int = 10) -> List[Dict[st
             TestRun.id.label("run_id"),
             TestRun.status,
             TestRun.started_at,
-            TestRun.finished_at,
+            TestRun.created_at,
+            TestRun.completed_at.label("completed_at"),
             Website.id.label("website_id"),
             Website.name.label("website_name"),
             Website.base_url.label("target_url"),
-            ReportSummary.overall_score.label("score")
+            func.coalesce(ReportSummary.overall_score, TestRun.overall_score).label("score")
         )
-        .join(Website, TestRun.website_id == Website.id)
+        .outerjoin(Website, TestRun.website_id == Website.id)
         .outerjoin(ReportSummary, TestRun.id == ReportSummary.test_run_id)
-        .order_by(desc(TestRun.started_at))
+        .order_by(desc(func.coalesce(TestRun.started_at, TestRun.created_at)))
         .limit(limit)
     )
     result = await db.execute(stmt)
@@ -58,12 +59,13 @@ async def get_recent_activity(db: AsyncSession, limit: int = 10) -> List[Dict[st
     for r in rows:
         activity.append({
             "run_id": r["run_id"],
-            "website_id": r["website_id"],
-            "website_name": r["website_name"],
-            "target_url": r["target_url"],
+            "website_id": r["website_id"] or "",
+            "website_name": r["website_name"] or "Website Scan",
+            "target_url": r["target_url"] or "",
             "status": r["status"].value if hasattr(r["status"], "value") else str(r["status"]),
             "score": float(r["score"]) if r["score"] is not None else None,
-            "started_at": r["started_at"],
-            "finished_at": r["finished_at"]
+            "started_at": r["started_at"] or r["created_at"],
+            "completed_at": r["completed_at"],
+            "finished_at": r["completed_at"]
         })
     return activity

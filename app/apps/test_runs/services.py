@@ -8,6 +8,142 @@ from app.common.constants import RunStatus
 from app.core.exceptions import EntityNotFoundException, ScopeViolationException
 from test_engine.policy.allowlist import TargetAllowlistValidator
 
+from urllib.parse import urlparse
+from app.apps.websites.models import Website, CredentialRef
+from app.apps.scan_profiles.models import ScanProfile
+from app.core.security import encrypt_credential
+from app.apps.test_runs.serializers import QuickScanRequest
+
+async def dispatch_quick_scan(db: AsyncSession, request_data: QuickScanRequest) -> TestRun:
+    """End-to-end autonomous scan trigger: validates SSRF, auto-provisions website/profile, and queues scan."""
+    parsed = urlparse(request_data.url)
+    hostname = parsed.hostname or ""
+    if not hostname:
+        raise ScopeViolationException("Invalid target URL; missing hostname")
+
+    # 1. Enforce SSRF & Private Host Guardrails
+    TargetAllowlistValidator.assert_public_host(hostname)
+
+    # 2. Find or auto-provision Website
+    from sqlalchemy import select
+    clean_base_url = f"{parsed.scheme}://{parsed.netloc}"
+    stmt = select(Website).where(Website.base_url == clean_base_url)
+    res = await db.execute(stmt)
+    website = res.scalar_one_or_none()
+
+    if not website:
+        site_name = request_data.name or hostname.replace("www.", "").capitalize()
+        website = Website(
+            name=site_name,
+            base_url=clean_base_url,
+            allowed_domains=[hostname],
+            is_authorized=True,
+            is_active=True
+        )
+        db.add(website)
+        await db.flush()
+
+    # 3. Store credentials securely if provided
+    credentials_dict = None
+    if request_data.credentials and request_data.credentials.enabled:
+        cred_payload = request_data.credentials
+        raw_pw = cred_payload.password or ""
+        encrypted_pw = encrypt_credential(raw_pw)
+
+        # Check existing credential
+        cred_stmt = select(CredentialRef).where(
+            CredentialRef.website_id == website.id,
+            CredentialRef.key_name == "default_login"
+        )
+        c_res = await db.execute(cred_stmt)
+        existing_cred = c_res.scalar_one_or_none()
+
+        if existing_cred:
+            existing_cred.username = cred_payload.username
+            existing_cred.encrypted_secret = encrypted_pw
+        else:
+            new_cred = CredentialRef(
+                website_id=website.id,
+                key_name="default_login",
+                username=cred_payload.username,
+                encrypted_secret=encrypted_pw,
+                description="Auto-stored credentials for autonomous scan"
+            )
+            db.add(new_cred)
+
+        credentials_dict = {
+            "login_url": cred_payload.login_url or f"{clean_base_url}/login",
+            "username": cred_payload.username,
+            "password": raw_pw,
+            "auth_method": cred_payload.auth_method,
+            "success_indicator": cred_payload.success_indicator
+        }
+
+    # 4. Resolve ScanProfile from options
+    options_dict = request_data.options.model_dump() if request_data.options else {}
+    profile_stmt = select(ScanProfile).where(ScanProfile.name == "Quick Scan Profile")
+    p_res = await db.execute(profile_stmt)
+    scan_profile = p_res.scalar_one_or_none()
+
+    if scan_profile:
+        scan_profile.check_functional = options_dict.get("check_functional", True)
+        scan_profile.check_security = options_dict.get("check_security", True)
+        scan_profile.check_performance = options_dict.get("check_performance", True)
+        scan_profile.check_accessibility = options_dict.get("check_accessibility", True)
+        scan_profile.allow_state_changing = options_dict.get("allow_state_changing", False)
+        scan_profile.rate_limit = options_dict.get("rate_limit_rps", 10)
+        scan_profile.timeout_seconds = options_dict.get("timeout_seconds", 300)
+        scan_profile.browser_type = options_dict.get("browser_type", "chromium")
+        scan_profile.viewport_width = options_dict.get("viewport_width", 1280)
+        scan_profile.viewport_height = options_dict.get("viewport_height", 720)
+    else:
+        scan_profile = ScanProfile(
+            name="Quick Scan Profile",
+            description="Auto-generated scan profile for quick autonomous scans",
+            check_functional=options_dict.get("check_functional", True),
+            check_security=options_dict.get("check_security", True),
+            check_performance=options_dict.get("check_performance", True),
+            check_accessibility=options_dict.get("check_accessibility", True),
+            allow_state_changing=options_dict.get("allow_state_changing", False),
+            rate_limit=options_dict.get("rate_limit_rps", 10),
+            timeout_seconds=options_dict.get("timeout_seconds", 300),
+            browser_type=options_dict.get("browser_type", "chromium"),
+            viewport_width=options_dict.get("viewport_width", 1280),
+            viewport_height=options_dict.get("viewport_height", 720)
+        )
+        db.add(scan_profile)
+        await db.flush()
+
+    # 5. Create TestRun record
+    test_run = TestRun(
+        website_id=website.id,
+        scan_profile_id=scan_profile.id,
+        status=RunStatus.QUEUED,
+        started_at=datetime.now(timezone.utc)
+    )
+    db.add(test_run)
+    await db.commit()
+    await db.refresh(test_run)
+
+    # 6. Dispatch to Celery background worker
+    try:
+        from workers.tasks.run_scan import execute_website_scan
+        task = execute_website_scan.delay(
+            run_id=test_run.id,
+            target_url=request_data.url,
+            allowed_domains=website.allowed_domains,
+            test_pack_yaml=None,
+            credentials=credentials_dict,
+            options=options_dict
+        )
+        test_run.celery_task_id = task.id
+        await db.commit()
+    except Exception:
+        # Graceful fallback if Redis/Celery broker is offline in dev
+        pass
+
+    return test_run
+
 async def dispatch_scan_run(db: AsyncSession, request_data: TriggerScanRequest) -> TestRun:
     """Validate target, create TestRun record, and enqueue Celery worker task."""
     website = await get_website_by_id(db, request_data.website_id)

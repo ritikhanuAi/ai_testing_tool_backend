@@ -74,3 +74,99 @@ def test_not_found_error_envelope():
         assert payload["success"] is False
         assert payload["error"]["code"] == "HTTP_404"
         assert "not found" in payload["error"]["message"].lower()
+
+def test_quick_scan_dispatch_endpoint():
+    """Verify quick scan endpoint accepts URL, credentials, and advanced options."""
+    payload = {
+        "url": "https://example.com",
+        "name": "Example Test Site",
+        "credentials": {
+            "enabled": True,
+            "login_url": "https://example.com/login",
+            "username": "tester@example.com",
+            "password": "SecretPassword123"
+        },
+        "options": {
+            "check_functional": True,
+            "check_security": True,
+            "check_performance": True,
+            "check_accessibility": True,
+            "browser_type": "chromium",
+            "use_ai_generation": True,
+            "ai_test_goals": "Verify home page layout"
+        }
+    }
+    mock_run = {
+        "id": "run-test-uuid-1234",
+        "website_id": "site-test-uuid-5678",
+        "scan_profile_id": "profile-test-uuid-9999",
+        "test_pack_id": None,
+        "status": "queued",
+        "celery_task_id": "celery-mock-task-id",
+        "overall_score": None,
+        "grade": None,
+        "started_at": "2026-10-23T12:00:00Z",
+        "completed_at": None,
+        "error_message": None
+    }
+    with patch("app.apps.test_runs.views.dispatch_quick_scan", new=AsyncMock(return_value=mock_run)):
+        response = client.post("/api/v1/test-runs/quick-scan", json=payload)
+        assert response.status_code == 202
+        body = response.json()
+        assert body["success"] is True
+        assert body["data"]["id"] == "run-test-uuid-1234"
+        assert body["data"]["status"] == "queued"
+
+def test_analyze_website_public_url():
+    """Verify URL analysis accurately identifies public websites with no credentials required."""
+    mock_resp = AsyncMock()
+    mock_resp.status_code = 200
+    mock_resp.url = "https://example.com"
+    mock_resp.headers = {"content-type": "text/html; charset=utf-8"}
+    mock_resp.text = "<html><head><title>Example Domain</title></head><body><h1>Welcome</h1><p>Public info</p></body></html>"
+
+    with patch("httpx.AsyncClient.get", new=AsyncMock(return_value=mock_resp)):
+        response = client.post("/api/v1/websites/analyze", json={"url": "https://example.com"})
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["success"] is True
+        data = payload["data"]
+        assert data["accessible"] is True
+        assert data["is_public_website"] is True
+        assert data["needs_credentials"] is False
+        assert data["page_title"] == "Example Domain"
+        assert data["credentials_requirement"]["required"] is False
+        assert data["recommended_options"]["allow_state_changing"] is False
+        assert data["recommended_options"]["check_functional"] is True
+        assert "ready_quick_scan_payload" in data
+        assert data["ready_quick_scan_payload"]["credentials"]["enabled"] is False
+
+def test_analyze_website_auth_gated_url():
+    """Verify URL analysis detects login form and recommends credentials."""
+    mock_resp = AsyncMock()
+    mock_resp.status_code = 200
+    mock_resp.url = "https://example.com/login"
+    mock_resp.headers = {"content-type": "text/html"}
+    mock_resp.text = "<html><head><title>Sign In</title></head><body><form action='/login'><input name='email'><input type='password' name='password'></form></body></html>"
+
+    with patch("httpx.AsyncClient.get", new=AsyncMock(return_value=mock_resp)):
+        response = client.post("/api/v1/test-runs/analyze-url", json={"url": "https://example.com"})
+        assert response.status_code == 200
+        payload = response.json()
+        data = payload["data"]
+        assert data["needs_credentials"] is True
+        assert data["credentials_requirement"]["required"] is True
+        assert data["credentials_requirement"]["auth_method"] == "form"
+        assert "password" in data["credentials_requirement"]["detected_fields"]
+        assert data["ready_quick_scan_payload"]["credentials"]["enabled"] is True
+
+def test_analyze_website_ssrf_blocked():
+    """Verify SSRF protection blocks local / private IP probe requests."""
+    response = client.post("/api/v1/websites/analyze", json={"url": "http://127.0.0.1:8000"})
+    assert response.status_code == 403
+    payload = response.json()
+    assert payload["success"] is False
+    assert payload["error"]["code"] == "SCOPE_VIOLATION"
+    assert "target scope" in payload["error"]["message"].lower() or "protected" in payload["error"]["message"].lower()
+
+

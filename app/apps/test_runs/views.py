@@ -3,15 +3,27 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List, Optional
 from app.core.database import get_db
 from app.common.serializers import ResponseEnvelope
-from app.apps.test_runs.serializers import TriggerScanRequest, TestRunResponse
-from app.apps.test_runs.services import dispatch_scan_run
+from app.apps.test_runs.serializers import TriggerScanRequest, TestRunResponse, QuickScanRequest
+from app.apps.test_runs.services import dispatch_scan_run, dispatch_quick_scan
 from app.apps.test_runs.selectors import list_test_runs, get_test_run_by_id
+
+async def quick_scan_view(
+    data: QuickScanRequest,
+    db: AsyncSession = Depends(get_db)
+) -> ResponseEnvelope[TestRunResponse]:
+    """Trigger an autonomous end-to-end multi-pillar test scan from URL and options."""
+    run = await dispatch_quick_scan(db, data)
+    return ResponseEnvelope(
+        message="Autonomous AI scan successfully queued",
+        data=TestRunResponse.model_validate(run)
+    )
 
 async def list_runs_view(
     website_id: Optional[str] = None,
+    limit: Optional[int] = 50,
     db: AsyncSession = Depends(get_db)
 ) -> ResponseEnvelope[List[TestRunResponse]]:
-    runs = await list_test_runs(db, website_id)
+    runs = await list_test_runs(db, website_id, limit=limit or 50)
     items = [TestRunResponse.model_validate(r) for r in runs]
     return ResponseEnvelope(
         message="Test runs retrieved successfully",
