@@ -23,6 +23,10 @@ class TestRun(BaseModel):
     def finished_at(self):
         return self.completed_at
 
+    @finished_at.setter
+    def finished_at(self, value):
+        self.completed_at = value
+
     # Relationships
     website = relationship("Website", back_populates="test_runs")
     scan_profile = relationship("ScanProfile", back_populates="test_runs")

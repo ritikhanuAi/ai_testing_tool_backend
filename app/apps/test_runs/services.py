@@ -220,7 +220,7 @@ async def cancel_scan_run(db: AsyncSession, run_id: str) -> TestRun:
             pass
 
     test_run.status = RunStatus.CANCELLED
-    test_run.finished_at = datetime.now(timezone.utc)
+    test_run.completed_at = datetime.now(timezone.utc)
     await db.commit()
     await db.refresh(test_run)
     return test_run
