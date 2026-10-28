@@ -94,7 +94,7 @@ class FunctionalSpider:
         """)
 
         # Add broken image findings
-        for img_src in set(broken_images)[:5]:
+        for img_src in list(set(broken_images))[:5]:
             findings.append(PillarFinding(
                 id=f"BROKEN-IMG-{abs(hash(img_src)) % 10000}",
                 title="Broken image asset detected",
