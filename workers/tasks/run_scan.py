@@ -14,8 +14,6 @@ from test_engine.pillars.performance.timing import NavigationTimingScanner
 from test_engine.pillars.performance.vitals import CoreWebVitalsScanner
 from test_engine.pillars.performance.resources import ResourceAuditScanner
 from test_engine.pillars.accessibility.runner import AccessibilityScanner
-from test_engine.pillars.accessibility.axe_runner import AxeCoreScanner
-from test_engine.pillars.accessibility.responsive import ResponsiveViewportScanner
 from test_engine.pillars.base import PillarScanResult
 from test_engine.scoring.aggregator import ReportAggregator
 from test_engine.schema.validator import SchemaValidator
@@ -226,7 +224,7 @@ async def _async_execute_scan(
                 valid, pack, _ = SchemaValidator.validate_yaml_pack(test_pack_yaml)
                 if valid and pack:
                     test_cases = pack.cases
-            elif opts.get("use_ai_generation", True):
+            elif opts.get("use_ai_generation", True) and opts.get("ai_test_goals"):
                 ai_cases = await _discover_and_generate_ai_tests(page, opts)
                 test_cases.extend(ai_cases)
 
@@ -290,20 +288,10 @@ async def _async_execute_scan(
         if await _is_cancelled(run_id):
             raise asyncio.CancelledError("Scan cancelled after performance pillar")
 
-        # 4. Accessibility & UX Pillar
+        # 4. Accessibility & UX Pillar (Axe-core WCAG + AI Code Fixes + Mobile + Multimodal Vision)
         if opts.get("check_accessibility", True):
-            a11y_findings, axe_score, axe_metrics = await AxeCoreScanner.run_axe(page)
-            mobile_findings, mobile_score = await ResponsiveViewportScanner.check_mobile_overflow(page)
-
-            a11y_all_findings = a11y_findings + mobile_findings
-            a11y_score = round((axe_score * 0.7) + (mobile_score * 0.3), 1)
-            a11y_result = PillarScanResult(
-                pillar=PillarType.ACCESSIBILITY,
-                score=a11y_score,
-                status="PASSED" if a11y_score >= 80 else "WARNING",
-                findings=a11y_all_findings,
-                metrics=axe_metrics
-            )
+            a11y_scanner = AccessibilityScanner()
+            a11y_result = await a11y_scanner.scan(page, target_url, run_id=run_id)
             active_pillars.append(a11y_result)
 
         # Fallback if no pillars selected
