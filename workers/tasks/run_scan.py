@@ -17,7 +17,7 @@ from test_engine.pillars.accessibility.runner import AccessibilityScanner
 from test_engine.pillars.base import PillarScanResult
 from test_engine.scoring.aggregator import ReportAggregator
 from test_engine.schema.validator import SchemaValidator
-from app.common.constants import PillarType, RunStatus
+from app.common.constants import PillarType, RunStatus, FindingSeverity
 
 # Ensure all SQLAlchemy models are registered in the Declarative Base registry
 import app.apps.websites.models  # noqa
@@ -162,19 +162,18 @@ async def _discover_and_generate_ai_tests(page, options: Dict[str, Any]) -> List
 async def _enrich_findings_with_ai(findings: List[Any]) -> None:
     """Diagnose high/critical findings and attach root-cause explanations."""
     try:
-        from ai_engine.clients.factory import LLMClientFactory
-        from ai_engine.prompts.failure_explainer import build_failure_explanation_prompt
-        client = LLMClientFactory.get_client()
+        from ai_engine.prompts.failure_explainer import AIFailureExplainer
         for f in findings:
             if getattr(f, "severity", None) in [FindingSeverity.CRITICAL, FindingSeverity.HIGH]:
-                prompt = build_failure_explanation_prompt(
-                    failed_step=f.title,
-                    error_message=f.description,
-                    dom_snippet=f.selector_or_url or ""
+                diagnosis = await AIFailureExplainer.explain_failure(
+                    test_title=f.title,
+                    failed_step_or_assert=f.selector_or_url or f.title,
+                    error_message=f.description
                 )
-                explanation = await client.generate(prompt=prompt)
-                if explanation and len(explanation.strip()) > 10:
-                    f.suggested_fix = f"AI Diagnosis & Remediation:\n{explanation.strip()}"
+                if diagnosis and diagnosis.get("suggested_fix"):
+                    root_cause = diagnosis.get("root_cause", "")
+                    fix = diagnosis.get("suggested_fix", "")
+                    f.suggested_fix = f"AI Diagnosis: {root_cause}\nFix: {fix}" if root_cause else fix
     except Exception as err:
         logger.warning(f"AI failure explainer non-fatal error: {err}")
 
