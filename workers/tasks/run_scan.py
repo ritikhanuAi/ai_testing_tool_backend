@@ -13,6 +13,7 @@ from test_engine.pillars.security.tls import TLSScanner
 from test_engine.pillars.performance.timing import NavigationTimingScanner
 from test_engine.pillars.performance.vitals import CoreWebVitalsScanner
 from test_engine.pillars.performance.resources import ResourceAuditScanner
+from test_engine.pillars.accessibility.runner import AccessibilityScanner
 from test_engine.pillars.accessibility.axe_runner import AxeCoreScanner
 from test_engine.pillars.accessibility.responsive import ResponsiveViewportScanner
 from test_engine.pillars.base import PillarScanResult

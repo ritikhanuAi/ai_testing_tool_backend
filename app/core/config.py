@@ -1,4 +1,4 @@
-from pydantic_settings import BaseSettings, SettingsConfigDict
+﻿from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 from typing import List, Optional
 import os
@@ -37,9 +37,12 @@ class Settings(BaseSettings):
     CELERY_RESULT_BACKEND: str = "redis://localhost:6379/2"
 
     # AI Engine
-    AI_PROVIDER: str = "ollama"  # ollama | openai | anthropic
+    AI_PROVIDER: str = "stpi"
     OLLAMA_BASE_URL: str = "http://localhost:11434"
-    OLLAMA_MODEL: str = "llama3.2:latest"
+    OLLAMA_MODEL: str = "qwen2.5:latest"
+    OPEN_BASE_URL: str = "https://stpi.roadathena.com/v1"
+    OPEN_API_KEY: str = "hanuai@321"
+    OPENAI_MODEL: str = "Qwen3.8-27B-GGUF"
     AI_TIMEOUT_SECONDS: int = 60
     OPENAI_API_KEY: Optional[str] = None
     ANTHROPIC_API_KEY: Optional[str] = None
@@ -56,3 +59,4 @@ class Settings(BaseSettings):
     DEFAULT_SCAN_RATE_LIMIT: int = 10  # Max requests per second to target site
 
 settings = Settings()
+

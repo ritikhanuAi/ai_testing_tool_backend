@@ -7,9 +7,14 @@ from test_engine.schema.case import TestCaseModel
 from test_engine.browser.action_runner import ActionRunner
 from test_engine.browser.assertion_runner import AssertionRunner
 from test_engine.browser.evidence import EvidenceCollector
+from test_engine.pillars.functional.spider import FunctionalSpider
+from ai_engine.prompts.test_generation import AITestCaseGenerator
 
 class FunctionalScanner(BasePillarScanner):
-    """Executes human-authored test cases and verifies site functional behavior."""
+    """
+    Autonomous QA Engineer: Discovers forms & links, synthesizes AI test cases,
+    executes user journeys via Playwright, and evaluates functional health.
+    """
 
     @property
     def pillar_type(self) -> PillarType:
@@ -25,22 +30,33 @@ class FunctionalScanner(BasePillarScanner):
     ) -> PillarScanResult:
         start_time = time.time()
         findings: List[PillarFinding] = []
-        cases = test_cases or []
+
+        # 1. Listen for uncaught JavaScript exceptions in the browser console
+        js_errors: List[str] = []
+        page.on("pageerror", lambda err: js_errors.append(str(err)))
+
+        # 2. Concurrently audit links and broken images
+        link_findings = await FunctionalSpider.audit_links_and_images(page, target_url)
+        findings.extend(link_findings)
+
+        # 3. Discover interactive forms and inputs in the live DOM
+        forms = await FunctionalSpider.extract_forms(page)
+
+        # 4. Generate AI test cases automatically if not manually provided
+        cases = list(test_cases) if test_cases else []
+        if not cases and forms:
+            cases = await AITestCaseGenerator.generate_suite_for_forms(forms, target_url)
 
         total_cases = len(cases)
         passed_cases = 0
 
-        # Listen for uncaught JavaScript errors in browser console
-        js_errors: List[str] = []
-        page.on("pageerror", lambda err: js_errors.append(str(err)))
-
+        # 5. Execute all test cases with Playwright
         for case in cases:
             case_passed = True
             for step in case.steps:
                 step_result = await ActionRunner.execute_step(page, step)
                 if step_result["status"] == "FAILED":
                     case_passed = False
-                    # Capture screenshot on failure
                     screenshot_path = await EvidenceCollector.capture_screenshot(
                         page, run_id=run_id, case_id=case.id
                     )
@@ -51,7 +67,7 @@ class FunctionalScanner(BasePillarScanner):
                         severity=FindingSeverity.HIGH,
                         evidence_path=screenshot_path,
                         selector_or_url=step.target,
-                        suggested_fix="Verify element locator and page state timing."
+                        suggested_fix="Verify element visibility, selector accuracy, or page load state."
                     ))
                     break
 
@@ -69,15 +85,15 @@ class FunctionalScanner(BasePillarScanner):
                             description=f"Expected: {assert_res.get('expected')}, Got: {assert_res.get('actual')}",
                             severity=FindingSeverity.HIGH,
                             evidence_path=screenshot_path,
-                            selector_or_url=assertion.target,
-                            suggested_fix="Check if application data or business logic returned the correct response."
+                            selector_or_url=assertion.target or assertion.value,
+                            suggested_fix="Check application logic, validation feedback, or server response."
                         ))
                         break
 
             if case_passed:
                 passed_cases += 1
 
-        # Check for uncaught JS errors
+        # 6. Record unhandled JavaScript console exceptions
         if js_errors:
             for i, err in enumerate(js_errors[:5]):
                 findings.append(PillarFinding(
@@ -85,11 +101,19 @@ class FunctionalScanner(BasePillarScanner):
                     title="Uncaught JavaScript exception in browser",
                     description=err,
                     severity=FindingSeverity.MEDIUM,
-                    suggested_fix="Review browser console logs and add try/catch or null checks."
+                    suggested_fix="Review browser console logs and add defensive null checks or try/catch blocks."
                 ))
 
-        # Calculate score: baseline 100%, deduct based on case failures
-        score = (passed_cases / total_cases * 100.0) if total_cases > 0 else 100.0
+        # 7. Calculate Score (0 - 100)
+        score = 100.0
+        if total_cases > 0:
+            score = (passed_cases / total_cases) * 80.0 + 20.0
+
+        # Deductions for broken links and JS errors
+        link_deductions = len([f for f in link_findings if f.severity == FindingSeverity.HIGH]) * 10.0 + \
+                          len([f for f in link_findings if f.severity == FindingSeverity.MEDIUM]) * 5.0
+        score = max(0.0, score - link_deductions)
+
         if js_errors:
             score = max(0.0, score - min(20.0, len(js_errors) * 5.0))
 
@@ -105,6 +129,8 @@ class FunctionalScanner(BasePillarScanner):
                 "total_cases": total_cases,
                 "passed_cases": passed_cases,
                 "failed_cases": total_cases - passed_cases,
+                "forms_discovered": len(forms),
+                "broken_links_count": len(link_findings),
                 "js_errors_count": len(js_errors)
             },
             duration_sec=round(duration, 2)
