@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
-from ai_engine.clients.factory import LLMClientFactory
+from ai_engine.clients.remote import RemoteLLMClient
 
 
 class VisionIssue(BaseModel):
@@ -62,10 +62,12 @@ class UXVisionEvaluator:
         else:
             start, end = cleaned.find("["), cleaned.rfind("]")
             if start < 0 or end < start:
-                return []
+                raise ValueError("Vision model did not return a JSON list")
             json_text = cleaned[start:end + 1]
         result = json.loads(json_text)
-        return result if isinstance(result, list) else []
+        if not isinstance(result, list):
+            raise ValueError("Vision model response was not a JSON list")
+        return result
 
     @classmethod
     async def evaluate_viewports(
@@ -75,41 +77,38 @@ class UXVisionEvaluator:
         mobile_bytes: bytes,
         state_comparison: Optional[List[bytes]] = None,
     ) -> List[Dict[str, Any]]:
-        try:
-            client = LLMClientFactory.get_client()
-            if not await client.is_available() or not hasattr(client, "generate_with_vision"):
-                return []
-            prompt = (
-                "Image 1 is desktop at 1280x720, image 2 is tablet at 768x1024, "
-                "and image 3 is mobile at 375x667. Compare responsive layouts and report "
-                "only visible, actionable issues."
+        client = RemoteLLMClient()
+        if not await client.is_available():
+            raise ConnectionError("Configured remote VLM server is unavailable for visual review")
+        prompt = (
+            "Image 1 is desktop at 1280x720, image 2 is tablet at 768x1024, "
+            "and image 3 is mobile at 375x667. Compare responsive layouts and report "
+            "only visible, actionable issues."
+        )
+        images = [desktop_bytes, tablet_bytes, mobile_bytes]
+        if state_comparison and len(state_comparison) == 2:
+            prompt += (
+                " Image 4 is the desktop state before an interaction and image 5 is after it. "
+                "Compare them for unintended layout breakage; ignore expected text or selected-state changes. "
+                "Coordinates for interaction findings refer to the after screenshot."
             )
-            images = [desktop_bytes, tablet_bytes, mobile_bytes]
-            if state_comparison and len(state_comparison) == 2:
-                prompt += (
-                    " Image 4 is the desktop state before an interaction and image 5 is after it. "
-                    "Compare them for unintended layout breakage; ignore expected text or selected-state changes. "
-                    "Coordinates for interaction findings refer to the after screenshot."
-                )
-                images.extend(state_comparison)
-            response = await client.generate_with_vision(
-                prompt=prompt,
-                image_b64=[base64.b64encode(image).decode("ascii") for image in images],
-                system_prompt=VISION_UX_SYSTEM_PROMPT,
-            )
-            issues = []
-            for raw_issue in cls._extract_list(response):
-                if not isinstance(raw_issue, dict):
-                    continue
-                if not state_comparison or len(state_comparison) != 2:
-                    raw_issue = {**raw_issue, "source": "responsive"}
-                try:
-                    issues.append(VisionIssue.model_validate(raw_issue).model_dump())
-                except Exception:
-                    continue
-            return issues
-        except Exception:
-            return []
+            images.extend(state_comparison)
+        response = await client.generate_with_vision(
+            prompt=prompt,
+            image_b64=[base64.b64encode(image).decode("ascii") for image in images],
+            system_prompt=VISION_UX_SYSTEM_PROMPT,
+        )
+        issues = []
+        for raw_issue in cls._extract_list(response):
+            if not isinstance(raw_issue, dict):
+                continue
+            if not state_comparison or len(state_comparison) != 2:
+                raw_issue = {**raw_issue, "source": "responsive"}
+            try:
+                issues.append(VisionIssue.model_validate(raw_issue).model_dump())
+            except Exception:
+                continue
+        return issues
 
     @classmethod
     async def evaluate_screenshot(
@@ -119,9 +118,9 @@ class UXVisionEvaluator:
     ) -> List[Dict[str, Any]]:
         """Compatibility method for a single screenshot call."""
         try:
-            client = LLMClientFactory.get_client()
-            if not await client.is_available() or not hasattr(client, "generate_with_vision"):
-                return []
+            client = RemoteLLMClient()
+            if not await client.is_available():
+                raise ConnectionError("Configured remote VLM server is unavailable for visual review")
             label = viewport_label.lower()
             viewport = "mobile" if "mobile" in label else "tablet" if "tablet" in label else "desktop"
             dimensions = {"desktop": "1280x720", "tablet": "768x1024", "mobile": "375x667"}[viewport]

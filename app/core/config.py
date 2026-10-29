@@ -37,14 +37,14 @@ class Settings(BaseSettings):
     CELERY_RESULT_BACKEND: str = "redis://localhost:6379/2"
 
     # AI Engine
-    AI_PROVIDER: str = "stpi"
+    AI_PROVIDER: str = "remote"
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "qwen2.5:latest"
-    OPEN_BASE_URL: str = "https://stpi.roadathena.com/v1"
-    OPEN_API_KEY: str = "hanuai@321"
-    OPENAI_MODEL: str = "Qwen3.8-27B-GGUF"
+    OLLAMA_VISION_MODEL: str = "qwen2.5vl:3b"
+    REMOTE_LLM_BASE_URL: str = "https://stpi.roadathena.com/v1"
+    REMOTE_LLM_API_KEY: str = "hanuai@321"
+    REMOTE_LLM_MODEL: str = "Qwen3.8-27B-GGUF"
     AI_TIMEOUT_SECONDS: int = 60
-    OPENAI_API_KEY: Optional[str] = None
     ANTHROPIC_API_KEY: Optional[str] = None
 
     # Storage & Evidence

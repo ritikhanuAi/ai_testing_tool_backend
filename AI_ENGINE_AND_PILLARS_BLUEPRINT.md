@@ -3,7 +3,7 @@
 **Project:** AI-Powered Universal Website Tester  
 **Scope of Work:** AI Engine Infrastructure, Functionality Pillar, and UI/UX & Accessibility Pillar  
 **Target Directory:** `ai_testing_tool_backend`  
-**AI Inference Backend:** Remote STPI NVIDIA Tesla V100S GPU (32GB VRAM) running Unsloth Qwen-27B VLM (OpenAI-Compatible `/v1` endpoint) with Ollama fallback  
+**AI Inference Backend:** Remote STPI NVIDIA Tesla V100S GPU (32GB VRAM) running Unsloth Qwen-27B VLM through its chat-completions-compatible `/v1` endpoint, with Ollama fallback  
 
 ---
 
@@ -33,7 +33,7 @@ Our mission is to build the most advanced **Functionality** and **UI/UX & Access
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
 │                               AI ENGINE (ai_engine/)                                   │
 │  ┌─────────────────────────┐  ┌─────────────────────────┐  ┌────────────────────────┐  │
-│  │   LLMClientFactory      │  │  OpenAICompatibleClient │  │      OllamaClient      │  │
+│  │   LLMClientFactory      │  │  RemoteLLMClient │  │      OllamaClient      │  │
 │  │  (Dynamic Provider)     │  │  (STPI Tesla V100 GPU)  │  │   (Local Fallback)     │  │
 │  └────────────┬────────────┘  └────────────┬────────────┘  └───────────┬────────────┘  │
 │               │                            │                           │               │
@@ -141,8 +141,8 @@ While other teams rely solely on rule-based linters, our solution implements a *
 We will implement this in a structured, phased order:
 
 ### Step 1: Remote STPI AI Engine Client Setup
-- Create `ai_engine/clients/openai_compat.py` (Supports Bearer auth, custom base URLs, text generation, and vision image payloads).
-- Update `ai_engine/clients/factory.py` to support `AI_PROVIDER=stpi` or `AI_PROVIDER=openai_compat`.
+- Create `ai_engine/clients/remote.py` (Supports Bearer auth, custom base URLs, text generation, and vision image payloads).
+- Update `ai_engine/clients/factory.py` to support `AI_PROVIDER=stpi` or `AI_PROVIDER=remote`.
 - Update `ai_engine/config.py` to include base URL, API key, and model names.
 
 ### Step 2: Build the Functionality Tool (Our First Focus)

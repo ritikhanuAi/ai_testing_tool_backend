@@ -51,8 +51,15 @@ class UXVisionScanner:
             issues = await UXVisionEvaluator.evaluate_viewports(
                 desktop_bytes, tablet_bytes, mobile_bytes, state_comparison=state_comparison
             )
-        except Exception:
-            return findings, 100.0
+        except Exception as error:
+            findings.append(PillarFinding(
+                id="UX-VISION-REVIEW-UNAVAILABLE",
+                title="AI visual review could not be completed",
+                description=f"The configured remote VLM review did not complete ({type(error).__name__}); visual quality is ungraded.",
+                severity=FindingSeverity.MEDIUM,
+                suggested_fix="Check REMOTE_LLM_BASE_URL, REMOTE_LLM_API_KEY, REMOTE_LLM_MODEL, and confirm the server model supports image input.",
+            ))
+            return findings, 0.0
         finally:
             await page.set_viewport_size(original_viewport)
 

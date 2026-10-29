@@ -21,7 +21,7 @@ The platform evaluates web applications across four core quality dimensions:
 1. **Functional Testing:** Authored YAML/JSON test packs, deterministic DOM assertions, route health, browser failures, and a bounded AI-guided interaction journey when no test pack is supplied. Read-only is the default; risky state-changing actions require an enabled profile.
 2. **Security Testing:** Checks response headers/CSP, cookie flags, mixed content, insecure forms/password transport, server errors, TLS certificates and legacy protocols, and a short list of exposed files/endpoints.
 3. **Performance Testing:** Uses browser timing observers and resource measurements on crawled pages, reports large-resource findings and page-sample p75 values.
-4. **UX & Accessibility Testing:** Runs axe-core WCAG checks, responsive overflow, and missing image alt-text checks on crawled routes; AI visual review is performed on the starting page.
+4. **UX & Accessibility Testing:** Runs axe-core WCAG checks, responsive overflow, and missing image alt-text checks on crawled routes; starting-page screenshots are sent to the configured remote vision model for visual review.
 
 ### Site Crawl and Grade Scope
 
@@ -36,9 +36,9 @@ The report records visited/discovered page counts and whether page, depth, link,
 - **Functional:** HTTP status and navigation failures for each visited route, JavaScript/console errors, failed first-party requests, broken images, plus authored or AI-guided starting-page interactions. Authored journeys run from the starting page and any explicit test-pack navigation.
 - **Security:** CSP and common security headers (including HSTS, frame, MIME, referrer, and permissions policies), cookie Secure/HttpOnly/SameSite and prefix rules, mixed content, HTTP form/password transport, server errors, and TLS certificate expiry/legacy TLS 1.0–1.1 support. It makes bounded GET checks for `.env`, `.git/HEAD`, `phpinfo.php`, and `actuator/health`; response bodies are sampled only to confirm expected content and are not included in findings.
 - **Performance:** Browser lab metrics include FCP, LCP, CLS, observed INP, TTFB, DOMContentLoaded/load timing, long-task blocking time, resource count/type, transfer/encoded sizes, and oversized assets. The performance runner reports per-metric page-sample p75 values and sample counts.
-- **Accessibility/UX:** axe-core 4.9.1 WCAG 2.0 A/AA checks, 375px responsive overflow, and missing image alt-text checks on successfully crawled routes. AI visual design review runs on the starting page; AI-generated axe fixes are limited to the first page successfully audited.
+- **Accessibility/UX:** axe-core 4.9.1 WCAG 2.0 A/AA checks, 375px responsive overflow, and missing image alt-text checks on successfully crawled routes. The starting page's desktop/tablet/mobile screenshots (and, when captured, before/after interaction screenshots) are sent to the configured remote VLM using `REMOTE_LLM_BASE_URL`, `REMOTE_LLM_API_KEY`, and `REMOTE_LLM_MODEL`; AI-generated axe fixes are limited to the first page successfully audited.
 
-The implementation uses Playwright browser APIs for crawl and UI observations, axe-core for automated WCAG rules, Python `ssl`/`socket` for TLS and public-DNS checks, HTTPX for bounded exposure checks, and the existing Celery/Redis queue for asynchronous execution and cancellation. It does not currently use Lighthouse, real-user monitoring, or a full OWASP active exploit suite.
+The implementation uses Playwright browser APIs for crawl and UI observations, axe-core for automated WCAG rules, Python `ssl`/`socket` for TLS and public-DNS checks, HTTPX for bounded exposure checks, and the existing Celery/Redis queue for asynchronous execution and cancellation. Screenshot review sends base64 PNGs to the configured server's chat-completions-compatible `/chat/completions` endpoint, independently of `AI_PROVIDER`; the server model must accept vision image inputs. If the server or vision model is unavailable, the report marks visual review unavailable rather than treating it as a clean result. This project does not currently use Lighthouse, real-user monitoring, or a full OWASP active exploit suite.
 
 Performance values are browser-lab samples, not real-user field data. INP is shown as unmeasured when the scan observes no interaction; the crawler does not click controls just to manufacture an interaction score. Resource size metrics also show how many browser entries were unavailable due to cross-origin timing restrictions. Long-task blocking time is an observed-load approximation, not a Lighthouse score.
 
@@ -145,7 +145,7 @@ In your frontend application:
 ## Quickstart Guide
 
 ### 1. Running with Docker Compose (Recommended)
-Spawns PostgreSQL, Redis, Celery Worker (with Playwright browsers installed), the FastAPI Web server, and Ollama:
+Spawns PostgreSQL, Redis, Celery Worker (with Playwright browsers installed), the FastAPI Web server, and Ollama (available for other local AI uses):
 
 ```bash
 # Copy environment variables
@@ -153,6 +153,9 @@ cp .env.example .env
 
 # Launch all services
 docker-compose up --build
+
+# Screenshot review uses REMOTE_LLM_BASE_URL / REMOTE_LLM_API_KEY / REMOTE_LLM_MODEL from .env.
+# The configured remote model must accept image input through the chat-completions-compatible API.
 ```
 
 Access the OpenAPI Swagger Explorer at `http://localhost:8000/docs`.

@@ -98,6 +98,9 @@ class AccessibilityScanner(BasePillarScanner):
             page, run_id=run_id, comparison_paths=comparison_paths
         )
         findings.extend(vision_findings)
+        vision_review_completed = not any(
+            finding.id == "UX-VISION-REVIEW-UNAVAILABLE" for finding in vision_findings
+        )
         total_findings = len(findings)
         finding_severity_counts = {
             member.value: sum(finding.severity == member for finding in findings)
@@ -134,6 +137,7 @@ class AccessibilityScanner(BasePillarScanner):
             or accessibility_page_errors
             or crawl_limited
             or crawl_pages_not_audited
+            or not vision_review_completed
         ):
             status = "WARNING"
 
@@ -153,6 +157,7 @@ class AccessibilityScanner(BasePillarScanner):
                 "mobile_responsive_score": mobile_score,
                 "readability_score": read_score,
                 "vision_ux_score": vision_score,
+                "vision_review_completed": vision_review_completed,
                 "total_findings": total_findings,
                 "finding_count": total_findings,
                 "reported_findings": min(total_findings, 1000),
@@ -166,7 +171,10 @@ class AccessibilityScanner(BasePillarScanner):
                 "score_unavailable": pages_audited == 0,
                 "score_note": (
                     "No axe-core audit completed; 0 is not a measured zero-violation result."
-                    if pages_audited == 0 else "Page scores average successful axe-core audits in this crawl."
+                    if pages_audited == 0 else (
+                        "The configured remote VLM review was unavailable; its 15% score component is zero."
+                        if not vision_review_completed else "Page scores average successful axe-core audits in this crawl."
+                    )
                 ),
                 "crawl_coverage": crawl_result.report_summary() if crawl_result else {},
             },
