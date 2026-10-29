@@ -46,12 +46,16 @@ def calculate_pillar_deductions(findings: List[PillarFinding], max_occurrences_p
     return score, deductions_list
 
 def calculate_overall_score(pillar_scores: dict) -> float:
-    """Calculate weighted composite score from 4 pillar scores."""
+    """Calculate a weighted score from the pillars that actually ran."""
     total_score = 0.0
+    total_weight = 0.0
     for pillar, weight in DEFAULT_PILLAR_WEIGHTS.items():
-        score = pillar_scores.get(pillar, 100.0)
-        total_score += score * weight
-    return round(total_score, 1)
+        if pillar in pillar_scores:
+            total_score += pillar_scores[pillar] * weight
+            total_weight += weight
+    if not total_weight:
+        return 0.0
+    return round(total_score / total_weight, 1)
 
 def assign_grade(score: float) -> str:
     """Assign letter grade to numerical score."""

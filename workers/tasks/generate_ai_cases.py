@@ -12,13 +12,16 @@ async def _async_generate_cases(page_description: str, form_fields: str = "") ->
     client = LLMClientFactory.get_client()
     prompt = build_case_generation_prompt(page_description, form_fields)
 
-    raw_response = await client.generate(prompt=prompt, system_prompt=SYSTEM_PROMPT)
-    valid, case_model, error = SchemaEnforcer.parse_test_case(raw_response)
+    valid, case_model, error = await SchemaEnforcer.generate_and_validate_with_retry(
+        llm_client=client,
+        system_prompt=SYSTEM_PROMPT,
+        initial_prompt=prompt,
+    )
 
     if valid and case_model:
         return {"success": True, "case": case_model.model_dump()}
     else:
-        return {"success": False, "error": error, "raw": raw_response}
+        return {"success": False, "error": error, "raw": None}
 
 @celery_app.task(name="workers.tasks.generate_ai_cases.generate_test_case_task")
 def generate_test_case_task(page_description: str, form_fields: str = ""):

@@ -22,7 +22,7 @@ The project is strictly partitioned into **four independent architectural layers
 │ 2. Background Worker Layer: workers/                                        │
 │    • Celery tasks running out-of-process via Redis broker                   │
 │    • Bridges app/ database records with test_engine/ execution              │
-│    • Handles timeouts (300s), concurrency, and emergency stops              │
+│    • Handles scan-profile timeouts (30–1800s), concurrency, and emergency stops│
 └──────────────────────────────────────┬──────────────────────────────────────┘
                                        │ Invokes pure Python scanners
                                        ▼
@@ -47,6 +47,9 @@ The project is strictly partitioned into **four independent architectural layers
 
 ## 2. The 10 "Never-Violate" Rules (Code Architecture Commandments)
 
+### Site Scan Flow and Grade Coverage
+The Celery worker starts an authorized browser context, checks `robots.txt`/sitemaps, then crawls approved anchor links with page, depth, link, sitemap, time, and request-rate bounds. The resulting page inventory feeds functional route-health checks, per-page security and performance audits, and per-page automated accessibility checks. Authored interaction journeys and visual AI review run on the starting page. Reports include crawl coverage, per-pillar status, score deductions, effective pillar weights, and lab-versus-field measurement notes. A `WARNING` means the scan did not earn a complete pass; a `SKIPPED` pillar is excluded from the overall grade.
+
 ### Rule 1: No Direct Browser Automation Inside FastAPI (`app/`)
 * **Prohibited:** Never instantiate Playwright, launch Chromium, or call `page.goto()` inside any FastAPI route, selector, or service under `app/`.
 * **Reason:** Browser scans take seconds to minutes. Running them inside a web request worker blocks uvicorn worker threads and causes HTTP timeouts.
@@ -61,7 +64,7 @@ The project is strictly partitioned into **four independent architectural layers
 * **Requirement:** Every pillar scanner must inherit from `test_engine.pillars.base.BasePillarScanner` and return a `PillarScanResult` containing:
   - `pillar`: One of `PillarType` (`functional`, `security`, `performance`, `accessibility`)
   - `score`: `float` strictly bounded between `0.0` and `100.0`
-  - `status`: `"PASSED" | "WARNING" | "FAILED"`
+  - `status`: `"PASSED" | "WARNING" | "FAILED" | "SKIPPED"`
   - `findings`: `List[PillarFinding]` with explicit severity levels
   - `metrics`: `Dict[str, Any]` telemetry data
 
@@ -76,7 +79,7 @@ The project is strictly partitioned into **four independent architectural layers
 * **Prohibited:** Never disable target allowlist checks or browser route interception to "make a test work".
 * **Requirement:**
   - Before a scan is queued, `TargetAllowlistValidator.validate_target()` must verify that the target URL matches the pre-approved domains.
-  - In production, private IP addresses (`10.0.0.0/8`, `127.0.0.0/8`, `169.254.0.0/16`, etc.) are strictly forbidden (SSRF protection).
+  - Private, reserved, unresolved, and non-public IP addresses (`10.0.0.0/8`, `127.0.0.0/8`, `169.254.0.0/16`, etc.) are forbidden in every environment (SSRF protection).
   - Every Playwright context must attach `ScopeGuard.intercept_route` to ensure the browser cannot wander to unauthorized third-party domains.
   - Test cases flagged with `risk: state_changing` cannot be executed if the scan profile is `allow_state_changing: false` (read-only default).
 

@@ -38,7 +38,7 @@ class CookieSecurityScanner:
                 ))
                 deduction += 15.0
 
-            if same_site not in ["lax", "strict"]:
+            if same_site not in ["lax", "strict", "none"]:
                 findings.append(PillarFinding(
                     id=f"SEC-COOKIE-NOSAMESITE-{name}",
                     title=f"Cookie '{name}' lacks strict 'SameSite' policy",
@@ -48,6 +48,38 @@ class CookieSecurityScanner:
                     suggested_fix="Set 'SameSite=Lax' or 'SameSite=Strict'."
                 ))
                 deduction += 4.0
+            elif same_site == "none" and not is_secure:
+                findings.append(PillarFinding(
+                    id=f"SEC-COOKIE-NONE-NOT-SECURE-{name}",
+                    title=f"Cookie '{name}' uses SameSite=None without Secure",
+                    description="Modern browsers require Secure for cross-site cookies, and the cookie may be exposed over HTTP.",
+                    severity=FindingSeverity.HIGH,
+                    selector_or_url=name,
+                    suggested_fix="Set both Secure and SameSite=None only when cross-site use is required.",
+                ))
+                deduction += 15.0
+
+            if name.startswith("__Host-") and (not is_secure or c.get("path") != "/"):
+                findings.append(PillarFinding(
+                    id=f"SEC-COOKIE-HOST-PREFIX-{name}",
+                    title=f"Cookie '{name}' violates the __Host- prefix rules",
+                    description="A __Host- cookie must be Secure and use Path=/. The browser's cookie snapshot does not expose whether Domain was omitted.",
+                    severity=FindingSeverity.HIGH,
+                    selector_or_url=name,
+                    suggested_fix="Set Secure and Path=/; confirm the Set-Cookie header omits Domain.",
+                ))
+                deduction += 15.0
+
+            if name.startswith("__Secure-") and not is_secure:
+                findings.append(PillarFinding(
+                    id=f"SEC-COOKIE-SECURE-PREFIX-{name}",
+                    title=f"Cookie '{name}' violates the __Secure- prefix rules",
+                    description="A __Secure- cookie must be marked Secure.",
+                    severity=FindingSeverity.HIGH,
+                    selector_or_url=name,
+                    suggested_fix="Set the Secure attribute on this cookie.",
+                ))
+                deduction += 15.0
 
         score = max(0.0, 100.0 - deduction)
         return findings, score

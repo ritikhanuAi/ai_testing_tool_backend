@@ -59,17 +59,19 @@ class OpenAICompatClient(BaseLLMClient):
     async def generate_with_vision(
         self,
         prompt: str,
-        image_b64: str,
+        image_b64: str | List[str],
         system_prompt: Optional[str] = None
     ) -> str:
-        """Send a screenshot + prompt to our Qwen-27B Vision Projector on STPI."""
+        """Send one or more screenshots with a prompt to the configured vision model."""
         messages: List[Dict[str, Any]] = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
-        user_content = [
-            {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}}
-        ]
+        images = image_b64 if isinstance(image_b64, list) else [image_b64]
+        user_content = [{"type": "text", "text": prompt}]
+        user_content.extend(
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image}"}}
+            for image in images
+        )
         messages.append({"role": "user", "content": user_content})
         payload = {
             "model": self.model,

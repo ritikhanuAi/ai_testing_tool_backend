@@ -11,6 +11,7 @@ class PillarFinding(BaseModel):
     description: str
     severity: FindingSeverity
     evidence_path: Optional[str] = None
+    bounding_box: Optional[List[int]] = None
     selector_or_url: Optional[str] = None
     suggested_fix: Optional[str] = None
 
@@ -23,7 +24,7 @@ class PillarFinding(BaseModel):
 class PillarScanResult(BaseModel):
     pillar: PillarType
     score: float = Field(..., ge=0, le=100, description="Pillar score from 0 to 100")
-    status: str = Field(default="PASSED", description="PASSED, WARNING, FAILED")
+    status: str = Field(default="PASSED", description="PASSED, WARNING, FAILED, or SKIPPED")
     findings: List[PillarFinding] = Field(default_factory=list)
     metrics: Dict[str, Any] = Field(default_factory=dict)
     duration_sec: float = 0.0

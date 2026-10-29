@@ -6,13 +6,10 @@ from workers.celery_app import celery_app
 from test_engine.browser.pool import BrowserPool
 from test_engine.browser.context import ContextFactory
 from test_engine.pillars.functional.runner import FunctionalScanner
-from test_engine.pillars.security.headers import SecurityHeadersScanner
-from test_engine.pillars.security.cookies import CookieSecurityScanner
-from test_engine.pillars.security.exposures import SensitiveExposureScanner
-from test_engine.pillars.security.tls import TLSScanner
-from test_engine.pillars.performance.timing import NavigationTimingScanner
+from test_engine.crawl import CrawlResult, SiteCrawler, redact_url
+from test_engine.pillars.security.runner import SecurityScanner
+from test_engine.pillars.performance.runner import PerformanceScanner
 from test_engine.pillars.performance.vitals import CoreWebVitalsScanner
-from test_engine.pillars.performance.resources import ResourceAuditScanner
 from test_engine.pillars.accessibility.runner import AccessibilityScanner
 from test_engine.pillars.accessibility.axe_runner import AxeCoreScanner
 from test_engine.pillars.accessibility.responsive import ResponsiveViewportScanner
@@ -20,6 +17,7 @@ from test_engine.pillars.base import PillarScanResult
 from test_engine.scoring.aggregator import ReportAggregator
 from test_engine.schema.validator import SchemaValidator
 from app.common.constants import PillarType, RunStatus
+from app.core.config import settings
 
 logger = logging.getLogger("workers.tasks.run_scan")
 
@@ -97,92 +95,134 @@ async def _async_execute_scan(
     target_url: str,
     allowed_domains: List[str],
     test_pack_yaml: Optional[str] = None,
-    cookies: Optional[List[Dict[str, Any]]] = None
+    cookies: Optional[List[Dict[str, Any]]] = None,
+    scan_profile: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Async execution routine inside Playwright worker."""
     await _persist_scan_start(run_id)
-
-    browser = await BrowserPool.get_browser()
-    context = await ContextFactory.create_isolated_context(
-        browser=browser,
-        allowed_domains=set(allowed_domains),
-        cookies=cookies
-    )
-    page = await context.new_page()
-
+    profile = {
+        "check_functional": True,
+        "check_security": True,
+        "check_performance": True,
+        "check_accessibility": True,
+        "allow_state_changing": False,
+        "rate_limit": settings.DEFAULT_SCAN_RATE_LIMIT,
+        "timeout_seconds": 900,
+        **(scan_profile or {}),
+    }
+    context = None
     try:
-        # Initial navigation to target site
-        response = await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
-        headers = dict(response.headers) if response else {}
+        browser = await BrowserPool.get_browser()
+        context = await ContextFactory.create_isolated_context(
+            browser=browser,
+            allowed_domains=set(allowed_domains),
+            cookies=cookies,
+            request_rate_limit=int(profile["rate_limit"]),
+            target_url=target_url,
+        )
+        await CoreWebVitalsScanner.install_observer(context)
+        page = await context.new_page()
+
+        # Discover and visit safe, in-scope links before running site-wide audits.
+        crawl_result = await SiteCrawler.crawl(
+            page,
+            target_url,
+            set(allowed_domains),
+            max_pages=100,
+            max_depth=5,
+            # Reserve time for the four pillar scanners and report persistence.
+            timeout_seconds=max(5, int(profile["timeout_seconds"] * 0.6)),
+            request_rate_limit=int(profile["rate_limit"]),
+            cancellation_check=lambda: _is_cancelled(run_id),
+        )
 
         # Check cancellation before initial run
         if await _is_cancelled(run_id):
             raise asyncio.CancelledError("Scan cancelled before start")
 
-        # 1. Functional Pillar
+        # 1. Functional Pillar (the authored test pack runs against its starting page).
         test_cases = []
         if test_pack_yaml:
-            valid, pack, _ = SchemaValidator.validate_yaml_pack(test_pack_yaml)
-            if valid and pack:
-                test_cases = pack.cases
+            valid, pack, errors = SchemaValidator.validate_yaml_pack(test_pack_yaml)
+            if not valid or not pack:
+                raise ValueError(f"Test pack failed worker-side validation: {errors}")
+            test_cases = pack.cases
 
-        func_scanner = FunctionalScanner()
-        func_result = await func_scanner.scan(page, target_url, test_cases=test_cases, run_id=run_id)
+        if profile["check_functional"]:
+            response = await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+            func_result = await FunctionalScanner().scan(
+                page,
+                target_url,
+                test_cases=test_cases,
+                run_id=run_id,
+                allow_state_changing=bool(profile["allow_state_changing"]),
+                crawl_result=crawl_result,
+                initial_status_code=response.status if response else None,
+            )
+        else:
+            func_result = PillarScanResult(
+                pillar=PillarType.FUNCTIONAL,
+                score=100.0,
+                status="SKIPPED",
+                metrics={"skipped": True, "reason": "disabled by scan profile"},
+            )
 
         # Check cancellation before Security Pillar
         if await _is_cancelled(run_id):
             raise asyncio.CancelledError("Scan cancelled after functional pillar")
 
-        # 2. Security Pillar
-        sec_findings = []
-        sec_hdr_findings, sec_hdr_score = SecurityHeadersScanner.audit_headers(headers, target_url)
-        sec_findings.extend(sec_hdr_findings)
-
-        browser_cookies = await context.cookies()
-        sec_cookie_findings, sec_cookie_score = CookieSecurityScanner.audit_cookies(browser_cookies, target_url)
-        sec_findings.extend(sec_cookie_findings)
-
-        sec_exposure_findings, sec_exp_score = await SensitiveExposureScanner.check_exposures(target_url)
-        sec_findings.extend(sec_exposure_findings)
-
-        tls_findings, tls_score, tls_metrics = TLSScanner.audit_tls(target_url)
-        sec_findings.extend(tls_findings)
-
-        sec_score = round((sec_hdr_score + sec_cookie_score + sec_exp_score + tls_score) / 4.0, 1)
-        sec_result = PillarScanResult(
-            pillar=PillarType.SECURITY,
-            score=sec_score,
-            status="PASSED" if sec_score >= 80 else "WARNING",
-            findings=sec_findings,
-            metrics={"headers_checked": len(headers), "cookies_checked": len(browser_cookies), **tls_metrics}
-        )
+        # 2. Security Pillar, using observations from every crawled page.
+        if profile["check_security"]:
+            sec_result = await SecurityScanner().scan(
+                page,
+                target_url,
+                crawl_result=crawl_result,
+                request_rate_limit=int(profile["rate_limit"]),
+            )
+        else:
+            sec_result = PillarScanResult(
+                pillar=PillarType.SECURITY,
+                score=100.0,
+                status="SKIPPED",
+                metrics={"skipped": True, "reason": "disabled by scan profile"},
+            )
 
         # Check cancellation before Performance Pillar
         if await _is_cancelled(run_id):
             raise asyncio.CancelledError("Scan cancelled after security pillar")
 
-        # 3. Performance Pillar
-        perf_metrics, timing_findings = await NavigationTimingScanner.extract_timing(page)
-        vitals_metrics, vitals_findings = await CoreWebVitalsScanner.capture_vitals(page)
-        res_metrics, res_findings = await ResourceAuditScanner.audit_resources(page)
-
-        perf_findings = timing_findings + vitals_findings + res_findings
-        perf_score = max(0.0, 100.0 - (len(perf_findings) * 10.0))
-        perf_result = PillarScanResult(
-            pillar=PillarType.PERFORMANCE,
-            score=perf_score,
-            status="PASSED" if perf_score >= 75 else "WARNING",
-            findings=perf_findings,
-            metrics={**perf_metrics, **vitals_metrics, **res_metrics}
-        )
+        # 3. Performance Pillar, with page-level metrics plus site p75 summaries.
+        if profile["check_performance"]:
+            perf_result = await PerformanceScanner().scan(page, target_url, crawl_result=crawl_result)
+        else:
+            perf_result = PillarScanResult(
+                pillar=PillarType.PERFORMANCE,
+                score=100.0,
+                status="SKIPPED",
+                metrics={"skipped": True, "reason": "disabled by scan profile"},
+            )
 
         # Check cancellation before Accessibility Pillar
         if await _is_cancelled(run_id):
             raise asyncio.CancelledError("Scan cancelled after performance pillar")
 
         # 4. Accessibility & UX Pillar (Axe-core WCAG + AI Code Fixes + Mobile + Multimodal Vision)
-        a11y_scanner = AccessibilityScanner()
-        a11y_result = await a11y_scanner.scan(page, target_url, run_id=run_id)
+        if profile["check_accessibility"]:
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+            a11y_result = await AccessibilityScanner().scan(
+                page,
+                target_url,
+                run_id=run_id,
+                comparison_paths=func_result.metrics.get("visual_comparison_paths", []),
+                crawl_result=crawl_result,
+            )
+        else:
+            a11y_result = PillarScanResult(
+                pillar=PillarType.ACCESSIBILITY,
+                score=100.0,
+                status="SKIPPED",
+                metrics={"skipped": True, "reason": "disabled by scan profile"},
+            )
 
         # Aggregate 4 Pillars
         unified_report = ReportAggregator.aggregate(
@@ -196,6 +236,9 @@ async def _async_execute_scan(
         return report_dict
 
     except asyncio.CancelledError:
+        current_task = asyncio.current_task()
+        if current_task and current_task.cancelling():
+            raise
         logger.info(f"Scan run {run_id} aborted due to cancellation.")
         await _persist_scan_failure(run_id, "Scan cancelled by user request", is_cancelled=True)
         return {"status": "CANCELLED", "run_id": run_id}
@@ -203,7 +246,8 @@ async def _async_execute_scan(
         await _persist_scan_failure(run_id, str(exc), is_cancelled=False)
         raise
     finally:
-        await context.close()
+        if context:
+            await context.close()
 
 @celery_app.task(bind=True, name="workers.tasks.run_scan.execute_website_scan")
 def execute_website_scan(
@@ -212,14 +256,21 @@ def execute_website_scan(
     target_url: str,
     allowed_domains: List[str],
     test_pack_yaml: Optional[str] = None,
-    cookies: Optional[List[Dict[str, Any]]] = None
+    cookies: Optional[List[Dict[str, Any]]] = None,
+    scan_profile: Optional[Dict[str, Any]] = None,
 ):
     """Celery task entrypoint."""
-    logger.info(f"Starting automated scan task for run {run_id} on {target_url}")
-    return asyncio.run(_async_execute_scan(
-        run_id=run_id,
-        target_url=target_url,
-        allowed_domains=allowed_domains,
-        test_pack_yaml=test_pack_yaml,
-        cookies=cookies
-    ))
+    logger.info(f"Starting automated scan task for run {run_id} on {redact_url(target_url)}")
+    timeout_seconds = int((scan_profile or {}).get("timeout_seconds", 900))
+    try:
+        return asyncio.run(asyncio.wait_for(_async_execute_scan(
+            run_id=run_id,
+            target_url=target_url,
+            allowed_domains=allowed_domains,
+            test_pack_yaml=test_pack_yaml,
+            cookies=cookies,
+            scan_profile=scan_profile,
+        ), timeout=timeout_seconds))
+    except asyncio.TimeoutError:
+        asyncio.run(_persist_scan_failure(run_id, f"Scan exceeded its {timeout_seconds}-second profile timeout"))
+        return {"status": "FAILED", "run_id": run_id, "error": "scan_timeout"}
