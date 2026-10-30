@@ -9,10 +9,20 @@ async def save_report(db: AsyncSession, test_run_id: str, report_data: Dict[str,
     pillar_res = report_data.get("pillar_results", {})
     sev_counts = report_data.get("findings_by_severity", {})
 
-    func_score = pillar_res.get("functional", {}).get("score", 100.0) if isinstance(pillar_res.get("functional"), dict) else 100.0
-    sec_score = pillar_res.get("security", {}).get("score", 100.0) if isinstance(pillar_res.get("security"), dict) else 100.0
-    perf_score = pillar_res.get("performance", {}).get("score", 100.0) if isinstance(pillar_res.get("performance"), dict) else 100.0
-    a11y_score = pillar_res.get("accessibility", {}).get("score", 100.0) if isinstance(pillar_res.get("accessibility"), dict) else 100.0
+    def pillar_score(name: str) -> float:
+        result = pillar_res.get(name, {})
+        if isinstance(result, dict):
+            if result.get("status") == "SKIPPED":
+                return 0.0
+            return float(result.get("score", 100.0))
+        if getattr(result, "status", None) == "SKIPPED":
+            return 0.0
+        return float(getattr(result, "score", 100.0))
+
+    func_score = pillar_score("functional")
+    sec_score = pillar_score("security")
+    perf_score = pillar_score("performance")
+    a11y_score = pillar_score("accessibility")
 
     report = ReportSummary(
         test_run_id=test_run_id,

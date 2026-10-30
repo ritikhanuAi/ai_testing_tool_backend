@@ -9,7 +9,10 @@ def test_allowlist_exact_match():
     valid, msg = TargetAllowlistValidator.validate_target("https://example.com/login", allowed)
     assert valid is True
 
-def test_allowlist_wildcard_match():
+def test_allowlist_wildcard_match(monkeypatch):
+    monkeypatch.setattr(
+        TargetAllowlistValidator, "assert_public_host", lambda host: (True, "Host is a public address")
+    )
     allowed = ["*.mycompany.org"]
     valid, msg = TargetAllowlistValidator.validate_target("https://app.mycompany.org", allowed)
     assert valid is True

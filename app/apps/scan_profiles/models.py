@@ -17,7 +17,7 @@ class ScanProfile(BaseModel):
     # Safety limits
     allow_state_changing = Column(Boolean, default=False, nullable=False)  # Read-only default!
     rate_limit = Column(Integer, default=10, nullable=False)  # Max req/sec
-    timeout_seconds = Column(Integer, default=300, nullable=False)
+    timeout_seconds = Column(Integer, default=900, nullable=False)
 
     # Browser Configuration
     browser_type = Column(String(50), default="chromium", nullable=False)

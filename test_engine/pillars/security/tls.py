@@ -10,6 +10,25 @@ class TLSScanner:
     """Audits SSL/TLS certificate validity, expiration, protocol version, and ciphers."""
 
     @staticmethod
+    def _probe_protocol(hostname: str, port: int, version: ssl.TLSVersion) -> Tuple[bool, str]:
+        """Attempt one bounded handshake for a specific legacy TLS version."""
+        try:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            context.minimum_version = version
+            context.maximum_version = version
+            try:
+                context.set_ciphers("ALL:@SECLEVEL=0")
+            except ssl.SSLError:
+                pass
+            with socket.create_connection((hostname, port), timeout=2.0) as sock:
+                with context.wrap_socket(sock, server_hostname=hostname) as tls_socket:
+                    return True, tls_socket.version() or version.name
+        except (ssl.SSLError, OSError, ValueError):
+            return False, ""
+
+    @staticmethod
     def audit_tls(target_url: str) -> Tuple[List[PillarFinding], float, Dict[str, Any]]:
         findings: List[PillarFinding] = []
         metrics: Dict[str, Any] = {"tls_enabled": False}
@@ -87,18 +106,7 @@ class TLSScanner:
                                 suggested_fix="Plan certificate renewal."
                             ))
 
-                    # 2. Audit Deprecated Protocols
-                    if protocol_version in ("TLSv1", "TLSv1.1", "SSLv3", "SSLv2"):
-                        findings.append(PillarFinding(
-                            id="SEC-TLS-DEPRECATED-PROTOCOL",
-                            title=f"Deprecated Protocol Version ({protocol_version}) Negotiated",
-                            description=f"Server allowed connection using deprecated and vulnerable {protocol_version}.",
-                            severity=FindingSeverity.HIGH,
-                            selector_or_url=hostname,
-                            suggested_fix="Disable TLS 1.0 and 1.1 in web server/load balancer configuration. Use TLS 1.2 or TLS 1.3 only."
-                        ))
-
-                    # 3. Audit Weak Ciphers
+                    # 2. Record the modern client's negotiated cipher.
                     if cipher_info and any(weak in cipher_info[0].upper() for weak in ["RC4", "3DES", "DES", "MD5", "NULL", "EXPORT"]):
                         findings.append(PillarFinding(
                             id="SEC-TLS-WEAK-CIPHER",
@@ -121,6 +129,28 @@ class TLSScanner:
         except (socket.timeout, socket.gaierror, ConnectionRefusedError, OSError) as e:
             # Network or connection issues during test/offline run
             metrics["tls_probe_error"] = str(e)
+
+        legacy_protocols = []
+        if scheme == "https":
+            versions = (
+                ("TLSv1", getattr(ssl.TLSVersion, "TLSv1", None)),
+                ("TLSv1.1", getattr(ssl.TLSVersion, "TLSv1_1", None)),
+            )
+            for label, version in versions:
+                if version is None:
+                    continue
+                supported, negotiated = TLSScanner._probe_protocol(hostname, port, version)
+                if supported:
+                    legacy_protocols.append(negotiated or label)
+                    findings.append(PillarFinding(
+                        id=f"SEC-TLS-DEPRECATED-{label.replace('.', '-')}",
+                        title=f"Server accepts deprecated {label}",
+                        description=f"A direct TLS handshake succeeded while restricted to {label}.",
+                        severity=FindingSeverity.HIGH,
+                        selector_or_url=hostname,
+                        suggested_fix="Disable TLS 1.0 and TLS 1.1 in the server or load balancer configuration; allow TLS 1.2 or newer.",
+                    ))
+        metrics["legacy_protocols_supported"] = legacy_protocols
 
         # Calculate score deductions
         deductions = 0.0

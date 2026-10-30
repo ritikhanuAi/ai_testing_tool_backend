@@ -12,8 +12,8 @@
 ### 📍 Phase 1: AI Engine Infrastructure (`ai_engine/`)
 - [x] **Step 1.1**: Inspect `ai_engine/clients/base.py` interface.
 - [x] **Step 1.2**: Update `ai_engine/config.py` with STPI remote model settings (`AI_BASE_URL`, `AI_API_KEY`, `AI_MODEL`).
-- [x] **Step 1.3**: Implement `ai_engine/clients/openai_compat.py` (High-speed Async HTTP client for STPI Qwen-27B).
-- [x] **Step 1.4**: Wire `ai_engine/clients/factory.py` to support `stpi` / `openai_compat`.
+- [x] **Step 1.3**: Implement `ai_engine/clients/remote.py` (High-speed Async HTTP client for STPI Qwen-27B).
+- [x] **Step 1.4**: Wire `ai_engine/clients/factory.py` to support `stpi` / `remote`.
 - [x] **Step 1.5**: Test live handshake from `ai_testing_tool_backend` to STPI GPU.
 
 ---

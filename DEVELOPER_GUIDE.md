@@ -17,7 +17,7 @@ Welcome to the **AI Website Testing Platform Backend**. This handbook provides a
    - [Step 7: Mount into the Global Router (`app/apps/router.py`)](#step-7-mount-into-the-global-router-appappsrouterpy)
    - [Step 8: Write Automated Tests](#step-8-write-automated-tests)
 4. [Step-by-Step AI Guide: Developing AI Capabilities](#4-step-by-step-ai-guide-developing-ai-capabilities)
-   - [Step 1: Configure Local (Ollama) & Cloud (OpenAI / Claude) LLMs](#step-1-configure-local-ollama--cloud-openai--claude-llms)
+   - [Step 1: Configure the Hosted Model Server or Local Ollama](#step-1-configure-the-hosted-model-server-or-local-ollama)
    - [Step 2: Anti-Injection Prompt Engineering](#step-2-anti-injection-prompt-engineering)
    - [Step 3: Schema Enforcer & Auto-Retry Loop](#step-3-schema-enforcer--auto-retry-loop)
    - [Step 4: Token-Optimized DOM Distillation](#step-4-token-optimized-dom-distillation)
@@ -46,7 +46,7 @@ This project is a **100% Headless REST API** built with FastAPI, designed to pow
 │   ├── schema/           # TestCaseModel, ActionStep, Assertion Pydantic contracts
 │   └── scoring/          # Transparent deduction rubric & fingerprints
 ├── ai_engine/            # LLM clients, prompts, parsers, and schema enforcers
-│   ├── clients/          # Ollama local client & cloud factory (OpenAI/Anthropic)
+│   ├── clients/          # Hosted model-server client and local Ollama client
 │   ├── parsers/          # SchemaEnforcer with 3-attempt auto-retry feedback loop
 │   └── prompts/          # Anti-injection prompt templates (<untrusted_page_context>)
 ├── workers/              # Celery asynchronous task queue
@@ -286,26 +286,17 @@ The AI layer in `ai_engine/` acts as an **assistive intelligence service**. It i
 
 ---
 
-### Step 1: Configure Local (Ollama) & Cloud (OpenAI / Claude) LLMs
+### Step 1: Configure the Hosted Model Server or Local Ollama
 
-The platform supports both local offline models via **Ollama** and cloud providers (**OpenAI**, **Anthropic**).
+Set `AI_PROVIDER=remote` to use the hosted model server, or `AI_PROVIDER=ollama` to use local Ollama. For the remote server, configure:
 
-Configure your provider in `.env`:
 ```bash
-# Local Offline (Default)
-AI_PROVIDER=ollama
-OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_MODEL=llama3.2
-
-# OR Cloud Provider
-# AI_PROVIDER=openai
-# OPENAI_API_KEY=sk-...
-# OPENAI_MODEL=gpt-4o-mini
-
-# OR Anthropic
-# AI_PROVIDER=anthropic
-# ANTHROPIC_API_KEY=sk-ant-...
+REMOTE_LLM_BASE_URL=https://your-vlm-server.example/v1
+REMOTE_LLM_API_KEY=your-server-api-key
+REMOTE_LLM_MODEL=your-vision-model-name
 ```
+
+The hosted endpoint must accept chat-completion requests and image inputs for screenshot review.
 
 #### Running Local Ollama
 To run locally without an external network connection or GPU:
@@ -326,7 +317,7 @@ In `ai_engine/clients/factory.py`, the system dynamically instantiates the corre
 from ai_engine.clients.factory import LLMClientFactory
 
 client = LLMClientFactory.get_client()
-# Returns OllamaClient, OpenAIClient, or AnthropicClient based on config.
+# Returns RemoteLLMClient or OllamaClient based on config.
 ```
 
 ---

@@ -15,7 +15,9 @@ class ContextFactory:
         custom_headers: Optional[Dict[str, str]] = None,
         viewport_width: Optional[int] = None,
         viewport_height: Optional[int] = None,
-        record_har_path: Optional[str] = None
+        record_har_path: Optional[str] = None,
+        request_rate_limit: int = 10,
+        target_url: str = "",
     ) -> BrowserContext:
         """Create a sandboxed browser context isolated from other scans."""
         context_kwargs: Dict[str, Any] = {
@@ -39,8 +41,11 @@ class ContextFactory:
             await context.set_extra_http_headers(custom_headers)
 
         # Attach Scope Guard to intercept and block out-of-scope egress
-        if allowed_domains:
-            guard = ScopeGuard(allowed_hostnames=allowed_domains)
-            await context.route("**/*", guard.intercept_route)
+        guard = ScopeGuard(
+            allowed_hostnames=allowed_domains,
+            max_requests_per_second=request_rate_limit,
+            target_url=target_url,
+        )
+        await context.route("**/*", guard.intercept_route)
 
         return context

@@ -7,9 +7,10 @@ from app.common.constants import PillarType
 def test_security_headers_scanner():
     mock_headers = {
         "content-type": "text/html",
-        "content-security-policy": "default-src 'self'",
+        "content-security-policy": "default-src 'self'; object-src 'none'",
         "strict-transport-security": "max-age=31536000",
-        "x-frame-options": "DENY"
+        "x-frame-options": "DENY",
+        "permissions-policy": "camera=(), microphone=()",
     }
     findings, score = SecurityHeadersScanner.audit_headers(mock_headers, "https://example.com")
     assert score >= 80.0

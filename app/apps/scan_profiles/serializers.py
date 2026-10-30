@@ -11,7 +11,7 @@ class ScanProfileCreateRequest(BaseModel):
     check_accessibility: bool = True
     allow_state_changing: bool = False
     rate_limit: int = Field(default=10, ge=1, le=50)
-    timeout_seconds: int = Field(default=300, ge=30, le=1800)
+    timeout_seconds: int = Field(default=900, ge=30, le=1800)
 
 class ScanProfileResponse(BaseSchema):
     id: str

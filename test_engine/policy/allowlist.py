@@ -2,7 +2,6 @@ import ipaddress
 import socket
 from urllib.parse import urlparse
 from typing import List, Tuple
-from app.core.config import settings
 
 class TargetAllowlistValidator:
     """Validates target URL against approved domain patterns and internal IP restrictions."""
@@ -25,8 +24,8 @@ class TargetAllowlistValidator:
             return False, "Empty hostname"
 
         # Direct check for localhost
-        if hostname.lower() in ("localhost", "localhost.localdomain"):
-            return False, f"Access to localhost ({hostname}) is strictly prohibited in production"
+        if hostname.lower().rstrip(".") in ("localhost", "localhost.localdomain"):
+            return False, f"Access to localhost ({hostname}) is strictly prohibited"
 
         try:
             # Check if hostname is directly an IP literal
@@ -38,13 +37,15 @@ class TargetAllowlistValidator:
                 addr_infos = socket.getaddrinfo(hostname, None)
                 resolved_ips = [ipaddress.ip_address(info[4][0]) for info in addr_infos]
             except socket.gaierror:
-                # DNS unresolvable during static check (allowed for offline tests/fixtures)
-                return True, "DNS unresolvable during static check"
+                return False, f"Hostname '{hostname}' could not be resolved"
             except Exception as e:
                 return False, f"DNS resolution failed: {str(e)}"
 
+        if not resolved_ips:
+            return False, f"Hostname '{hostname}' did not resolve to any address"
+
         for ip_addr in resolved_ips:
-            if ip_addr.is_private or ip_addr.is_loopback or ip_addr.is_link_local or ip_addr.is_reserved or ip_addr.is_multicast:
+            if not ip_addr.is_global:
                 return False, f"Hostname '{hostname}' resolves to protected/internal IP ({ip_addr})"
             for net in cls.PRIVATE_IP_RANGES:
                 if ip_addr in net:
@@ -55,28 +56,32 @@ class TargetAllowlistValidator:
     @classmethod
     def validate_target(cls, target_url: str, allowed_domains: List[str]) -> Tuple[bool, str]:
         """Verify target URL is well-formed, authorized, and not an unapproved internal address."""
-        if not target_url or not (target_url.startswith("http://") or target_url.startswith("https://")):
-            return False, "Target URL must start with http:// or https://"
+        if not target_url:
+            return False, "Target URL is required"
 
         try:
             parsed = urlparse(target_url)
+            if parsed.scheme.lower() not in {"http", "https"}:
+                return False, "Target URL must use HTTP or HTTPS"
+            if parsed.username or parsed.password:
+                return False, "Target URL must not contain embedded credentials"
+            _ = parsed.port
             hostname = parsed.hostname
             if not hostname:
                 return False, "Unable to extract valid hostname from target URL"
 
-            # Check for private/SSRF IP access if disallowed
-            if not settings.ALLOW_PRIVATE_IPS and settings.APP_ENV == "production":
-                is_public, reason = cls.assert_public_host(hostname)
-                if not is_public:
-                    return False, f"SSRF Protection: {reason}"
+            # Block private, reserved, and unresolved targets in every environment.
+            is_public, reason = cls.assert_public_host(hostname)
+            if not is_public:
+                return False, f"SSRF Protection: {reason}"
 
             # Match against allowed domain list
-            hostname_lower = hostname.lower()
+            hostname_lower = hostname.lower().rstrip(".")
             for pattern in allowed_domains:
-                pattern_lower = pattern.lower().strip()
+                pattern_lower = pattern.lower().strip().rstrip(".")
                 if pattern_lower.startswith("*."):
                     suffix = pattern_lower[2:]
-                    if hostname_lower.endswith(suffix):
+                    if hostname_lower != suffix and hostname_lower.endswith("." + suffix):
                         return True, "Authorized by wildcard rule"
                 elif hostname_lower == pattern_lower:
                     return True, "Authorized by exact domain match"

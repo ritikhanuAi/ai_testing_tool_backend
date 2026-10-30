@@ -15,6 +15,8 @@ class ActionType(str, Enum):
 class ActionStep(BaseModel):
     action: ActionType
     target: Optional[str] = Field(default=None, description="CSS selector or Playwright role locator (e.g. role=combobox[name='Region'])")
+    fallback_role: Optional[str] = Field(default=None, description="Accessible role used to recover a stale selector")
+    fallback_name: Optional[str] = Field(default=None, description="Accessible name used with fallback_role")
     value: Optional[str] = Field(default=None, description="Input text, option value, or URL")
     timeout_ms: Optional[int] = Field(default=10000, description="Step timeout in milliseconds")
     description: Optional[str] = Field(default=None, description="Human readable description of the step")

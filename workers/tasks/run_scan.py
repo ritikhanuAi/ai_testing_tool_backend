@@ -7,18 +7,16 @@ from workers.celery_app import celery_app
 from test_engine.browser.pool import BrowserPool
 from test_engine.browser.context import ContextFactory
 from test_engine.pillars.functional.runner import FunctionalScanner
-from test_engine.pillars.security.headers import SecurityHeadersScanner
-from test_engine.pillars.security.cookies import CookieSecurityScanner
-from test_engine.pillars.security.exposures import SensitiveExposureScanner
-from test_engine.pillars.security.tls import TLSScanner
-from test_engine.pillars.performance.timing import NavigationTimingScanner
+from test_engine.crawl import CrawlResult, SiteCrawler, redact_url
+from test_engine.pillars.security.runner import SecurityScanner
+from test_engine.pillars.performance.runner import PerformanceScanner
 from test_engine.pillars.performance.vitals import CoreWebVitalsScanner
-from test_engine.pillars.performance.resources import ResourceAuditScanner
 from test_engine.pillars.accessibility.runner import AccessibilityScanner
 from test_engine.pillars.base import PillarScanResult
 from test_engine.scoring.aggregator import ReportAggregator
 from test_engine.schema.validator import SchemaValidator
 from app.common.constants import PillarType, RunStatus, FindingSeverity
+from app.core.config import settings
 
 # Ensure all SQLAlchemy models are registered in the Declarative Base registry
 import app.apps.websites.models  # noqa
@@ -185,210 +183,185 @@ async def _async_execute_scan(
     test_pack_yaml: Optional[str] = None,
     cookies: Optional[List[Dict[str, Any]]] = None,
     credentials: Optional[Dict[str, Any]] = None,
-    options: Optional[Dict[str, Any]] = None
+    options: Optional[Dict[str, Any]] = None,
+    scan_profile: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Async execution routine inside Playwright worker."""
     from app.common.progress import ScanProgressTracker
     await _persist_scan_start(run_id)
-    await ScanProgressTracker.log(run_id, "INITIALIZING", f"Starting automated test scan on {target_url}", 5)
+    await ScanProgressTracker.log(run_id, "INITIALIZING", f"Starting automated test scan on {redact_url(target_url)}", 5)
+
     opts = options or {}
+    profile = {
+        "check_functional": True,
+        "check_security": True,
+        "check_performance": True,
+        "check_accessibility": True,
+        "allow_state_changing": False,
+        "rate_limit": settings.DEFAULT_SCAN_RATE_LIMIT,
+        "timeout_seconds": 900,
+        **opts,
+        **(scan_profile or {}),
+    }
+    creds = credentials or profile.get("credentials")
 
-    browser = await BrowserPool.get_browser()
-    await ScanProgressTracker.log(run_id, "INITIALIZING", "Created isolated Playwright browser context with ScopeGuard", 10)
-    context = await ContextFactory.create_isolated_context(
-        browser=browser,
-        allowed_domains=set(allowed_domains),
-        cookies=cookies
-    )
-    page = await context.new_page()
-
-    if opts.get("viewport_width") and opts.get("viewport_height"):
-        await page.set_viewport_size({"width": opts["viewport_width"], "height": opts["viewport_height"]})
-
+    context = None
     try:
+        browser = await BrowserPool.get_browser()
+        await ScanProgressTracker.log(run_id, "INITIALIZING", "Created isolated Playwright browser context with ScopeGuard", 10)
+        context = await ContextFactory.create_isolated_context(
+            browser=browser,
+            allowed_domains=set(allowed_domains),
+            cookies=cookies,
+            request_rate_limit=int(profile["rate_limit"]),
+            target_url=target_url,
+        )
+        await CoreWebVitalsScanner.install_observer(context)
+        page = await context.new_page()
+
+        if profile.get("viewport_width") and profile.get("viewport_height"):
+            await page.set_viewport_size({"width": profile["viewport_width"], "height": profile["viewport_height"]})
+
         # Pre-flight authentication if credentials supplied
-        if credentials:
-            await ScanProgressTracker.log(run_id, "AUTHENTICATING", f"Executing authentication flow on {credentials.get('login_url', target_url)}", 12)
-            await _perform_authentication(page, credentials)
+        if creds:
+            await ScanProgressTracker.log(run_id, "AUTHENTICATING", f"Executing authentication flow on {creds.get('login_url', target_url)}", 12)
+            await _perform_authentication(page, creds)
 
-        # Initial navigation to target site with smart DNS fallback handling
-        await ScanProgressTracker.log(run_id, "NAVIGATION", f"Navigating to entry page {target_url}...", 15)
-        response = None
-        nav_error = None
-        try:
-            response = await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
-        except Exception as e:
-            nav_error = e
-
-        if nav_error:
-            err_str = str(nav_error)
-            # Smart fallback for DNS misconfigurations (e.g. www vs non-www)
-            if "ERR_NAME_NOT_RESOLVED" in err_str:
-                parsed_tgt = urlparse(target_url)
-                fallback_url = None
-                if parsed_tgt.hostname:
-                    if parsed_tgt.hostname.startswith("www."):
-                        fallback_host = parsed_tgt.hostname[4:]
-                        fallback_url = target_url.replace(parsed_tgt.hostname, fallback_host)
-                    else:
-                        fallback_host = f"www.{parsed_tgt.hostname}"
-                        fallback_url = target_url.replace(parsed_tgt.hostname, fallback_host)
-
-                if fallback_url:
-                    await ScanProgressTracker.log(
-                        run_id, "NAVIGATION",
-                        f"DNS resolution failed for {target_url}. Auto-attempting fallback to {fallback_url}...",
-                        16, level="WARNING"
-                    )
-                    try:
-                        response = await page.goto(fallback_url, wait_until="domcontentloaded", timeout=30000)
-                        target_url = fallback_url
-                        nav_error = None
-                        await ScanProgressTracker.log(
-                            run_id, "NAVIGATION",
-                            f"Fallback succeeded! Proceeding with {fallback_url}",
-                            18
-                        )
-                    except Exception as fb_err:
-                        nav_error = fb_err
-
-            if nav_error:
-                diag = f"Navigation error on {target_url}: {str(nav_error)}"
-                if "ERR_NAME_NOT_RESOLVED" in str(nav_error):
-                    diag = f"Domain Name Not Resolved: Could not find DNS records for '{target_url}'. The website owner may not have configured this subdomain (e.g. try without 'www.')."
-                elif "ERR_CONNECTION_REFUSED" in str(nav_error):
-                    diag = f"Connection Refused: Target server at '{target_url}' is offline or rejecting connections."
-                elif "Timeout" in str(nav_error):
-                    diag = f"Connection Timeout: '{target_url}' took longer than 30 seconds to load."
-
-                await ScanProgressTracker.log(run_id, "FAILED", diag, 100, level="ERROR")
-                await _persist_scan_failure(run_id, diag, is_cancelled=False)
-                return {"status": "FAILED", "error": diag, "run_id": run_id}
-
-        headers = dict(response.headers) if response else {}
-        status_num = response.status if response else 200
-        await ScanProgressTracker.log(run_id, "NAVIGATION", f"Page loaded successfully (HTTP {status_num})", 18)
+        # Discover and visit safe, in-scope links before running site-wide audits.
+        await ScanProgressTracker.log(run_id, "CRAWLING", "Crawling in-scope routes and analyzing site structure...", 15)
+        crawl_result = await SiteCrawler.crawl(
+            page,
+            target_url,
+            set(allowed_domains),
+            max_pages=100,
+            max_depth=5,
+            # Reserve time for the four pillar scanners and report persistence.
+            timeout_seconds=max(5, int(profile["timeout_seconds"] * 0.6)),
+            request_rate_limit=int(profile["rate_limit"]),
+            cancellation_check=lambda: _is_cancelled(run_id),
+        )
 
         # Check cancellation before initial run
         if await _is_cancelled(run_id):
             raise asyncio.CancelledError("Scan cancelled before start")
 
-        active_pillars = []
+        # 1. Functional Pillar (the authored test pack runs against its starting page).
+        test_cases = []
+        if test_pack_yaml:
+            valid, pack, errors = SchemaValidator.validate_yaml_pack(test_pack_yaml)
+            if not valid or not pack:
+                raise ValueError(f"Test pack failed worker-side validation: {errors}")
+            test_cases = pack.cases
+        elif profile.get("use_ai_generation", True) and profile.get("ai_test_goals"):
+            await ScanProgressTracker.log(run_id, "FUNCTIONAL", "Synthesizing AI test scenarios for target goals...", 22)
+            ai_cases = await _discover_and_generate_ai_tests(page, profile)
+            test_cases.extend(ai_cases)
 
-        # 1. Functional Pillar
-        if opts.get("check_functional", True):
-            await ScanProgressTracker.log(run_id, "FUNCTIONAL", "Starting Functional Pillar: Analyzing DOM, forms & links...", 20)
+        if profile["check_functional"]:
+            cases_label = f"{len(test_cases)} authored test cases" if test_cases else "autonomous form discovery & AI interaction exploration"
+            await ScanProgressTracker.log(run_id, "FUNCTIONAL", f"Running Functional Pillar: Executing {cases_label}...", 25)
+            response = None
             try:
-                test_cases = []
-                if test_pack_yaml:
-                    valid, pack, _ = SchemaValidator.validate_yaml_pack(test_pack_yaml)
-                    if valid and pack:
-                        test_cases = pack.cases
-                elif opts.get("use_ai_generation", True) and opts.get("ai_test_goals"):
-                    await ScanProgressTracker.log(run_id, "FUNCTIONAL", "Synthesizing AI test scenarios for target goals...", 25)
-                    ai_cases = await _discover_and_generate_ai_tests(page, opts)
-                    test_cases.extend(ai_cases)
-
-                func_scanner = FunctionalScanner()
-                await ScanProgressTracker.log(run_id, "FUNCTIONAL", f"Running Playwright test execution ({len(test_cases)} user journeys)...", 30)
-                func_result = await func_scanner.scan(page, target_url, test_cases=test_cases, run_id=run_id)
-
-                if opts.get("ai_explain_failures", True) and func_result.findings:
-                    await ScanProgressTracker.log(run_id, "FUNCTIONAL", "Diagnosing functional failures with AI...", 40)
-                    await _enrich_findings_with_ai(func_result.findings)
-
-                active_pillars.append(func_result)
-                await ScanProgressTracker.log(run_id, "FUNCTIONAL", f"Functional pillar completed (Score: {func_result.score}/100, Findings: {len(func_result.findings)})", 45)
-            except Exception as f_err:
-                await ScanProgressTracker.log(run_id, "FUNCTIONAL", f"Functional pillar encountered error: {f_err}", 45, level="ERROR")
-                active_pillars.append(PillarScanResult(pillar=PillarType.FUNCTIONAL, score=60.0, status="WARNING", findings=[]))
+                response = await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+            except Exception as e:
+                err_str = str(e)
+                if "ERR_NAME_NOT_RESOLVED" in err_str:
+                    parsed_tgt = urlparse(target_url)
+                    if parsed_tgt.hostname:
+                        fallback_host = parsed_tgt.hostname[4:] if parsed_tgt.hostname.startswith("www.") else f"www.{parsed_tgt.hostname}"
+                        fallback_url = target_url.replace(parsed_tgt.hostname, fallback_host)
+                        try:
+                            response = await page.goto(fallback_url, wait_until="domcontentloaded", timeout=30000)
+                            target_url = fallback_url
+                        except Exception:
+                            pass
+            func_result = await FunctionalScanner().scan(
+                page,
+                target_url,
+                test_cases=test_cases,
+                run_id=run_id,
+                allow_state_changing=bool(profile["allow_state_changing"]),
+                crawl_result=crawl_result,
+                initial_status_code=response.status if response else None,
+            )
+            if profile.get("ai_explain_failures", True) and func_result.findings:
+                await ScanProgressTracker.log(run_id, "FUNCTIONAL", "Diagnosing functional failures with AI...", 40)
+                await _enrich_findings_with_ai(func_result.findings)
+            await ScanProgressTracker.log(run_id, "FUNCTIONAL", f"Functional pillar completed (Score: {func_result.score}/100, Findings: {len(func_result.findings)})", 48)
+        else:
+            func_result = PillarScanResult(
+                pillar=PillarType.FUNCTIONAL,
+                score=100.0,
+                status="SKIPPED",
+                metrics={"skipped": True, "reason": "disabled by scan profile"},
+            )
 
         if await _is_cancelled(run_id):
             raise asyncio.CancelledError("Scan cancelled after functional pillar")
 
-        # 2. Security Pillar
-        if opts.get("check_security", True):
+        # 2. Security Pillar, using observations from every crawled page.
+        if profile["check_security"]:
             await ScanProgressTracker.log(run_id, "SECURITY", "Starting Security Pillar: Auditing headers, cookies, TLS & exposures...", 50)
-            try:
-                sec_findings = []
-                sec_hdr_findings, sec_hdr_score = SecurityHeadersScanner.audit_headers(headers, target_url)
-                sec_findings.extend(sec_hdr_findings)
-
-                browser_cookies = await context.cookies()
-                sec_cookie_findings, sec_cookie_score = CookieSecurityScanner.audit_cookies(browser_cookies, target_url)
-                sec_findings.extend(sec_cookie_findings)
-
-                sec_exposure_findings, sec_exp_score = await SensitiveExposureScanner.check_exposures(target_url)
-                sec_findings.extend(sec_exposure_findings)
-
-                tls_findings, tls_score, tls_metrics = TLSScanner.audit_tls(target_url)
-                sec_findings.extend(tls_findings)
-
-                sec_score = round((sec_hdr_score + sec_cookie_score + sec_exp_score + tls_score) / 4.0, 1)
-                sec_result = PillarScanResult(
-                    pillar=PillarType.SECURITY,
-                    score=sec_score,
-                    status="PASSED" if sec_score >= 80 else "WARNING",
-                    findings=sec_findings,
-                    metrics={"headers_checked": len(headers), "cookies_checked": len(browser_cookies), **tls_metrics}
-                )
-                active_pillars.append(sec_result)
-                await ScanProgressTracker.log(run_id, "SECURITY", f"Security pillar completed (Score: {sec_score}/100, Findings: {len(sec_findings)})", 65)
-            except Exception as s_err:
-                await ScanProgressTracker.log(run_id, "SECURITY", f"Security pillar encountered error: {s_err}", 65, level="ERROR")
-                active_pillars.append(PillarScanResult(pillar=PillarType.SECURITY, score=80.0, status="WARNING", findings=[]))
+            sec_result = await SecurityScanner().scan(
+                page,
+                target_url,
+                crawl_result=crawl_result,
+                request_rate_limit=int(profile["rate_limit"]),
+            )
+            await ScanProgressTracker.log(run_id, "SECURITY", f"Security pillar completed (Score: {sec_result.score}/100, Findings: {len(sec_result.findings)})", 68)
+        else:
+            sec_result = PillarScanResult(
+                pillar=PillarType.SECURITY,
+                score=100.0,
+                status="SKIPPED",
+                metrics={"skipped": True, "reason": "disabled by scan profile"},
+            )
 
         if await _is_cancelled(run_id):
             raise asyncio.CancelledError("Scan cancelled after security pillar")
 
-        # 3. Performance Pillar
-        if opts.get("check_performance", True):
+        # 3. Performance Pillar, with page-level metrics plus site p75 summaries.
+        if profile["check_performance"]:
             await ScanProgressTracker.log(run_id, "PERFORMANCE", "Starting Performance Pillar: Measuring navigation timings and Core Web Vitals...", 70)
-            try:
-                perf_metrics, timing_findings = await NavigationTimingScanner.extract_timing(page)
-                vitals_metrics, vitals_findings = await CoreWebVitalsScanner.capture_vitals(page)
-                res_metrics, res_findings = await ResourceAuditScanner.audit_resources(page)
-
-                perf_findings = timing_findings + vitals_findings + res_findings
-                perf_score = max(0.0, 100.0 - (len(perf_findings) * 10.0))
-                perf_result = PillarScanResult(
-                    pillar=PillarType.PERFORMANCE,
-                    score=perf_score,
-                    status="PASSED" if perf_score >= 75 else "WARNING",
-                    findings=perf_findings,
-                    metrics={**perf_metrics, **vitals_metrics, **res_metrics}
-                )
-                active_pillars.append(perf_result)
-                await ScanProgressTracker.log(run_id, "PERFORMANCE", f"Performance pillar completed (Score: {perf_score}/100, Findings: {len(perf_findings)})", 80)
-            except Exception as p_err:
-                await ScanProgressTracker.log(run_id, "PERFORMANCE", f"Performance pillar encountered error: {p_err}", 80, level="ERROR")
-                active_pillars.append(PillarScanResult(pillar=PillarType.PERFORMANCE, score=80.0, status="WARNING", findings=[]))
+            perf_result = await PerformanceScanner().scan(page, target_url, crawl_result=crawl_result)
+            await ScanProgressTracker.log(run_id, "PERFORMANCE", f"Performance pillar completed (Score: {perf_result.score}/100, Findings: {len(perf_result.findings)})", 82)
+        else:
+            perf_result = PillarScanResult(
+                pillar=PillarType.PERFORMANCE,
+                score=100.0,
+                status="SKIPPED",
+                metrics={"skipped": True, "reason": "disabled by scan profile"},
+            )
 
         if await _is_cancelled(run_id):
             raise asyncio.CancelledError("Scan cancelled after performance pillar")
 
         # 4. Accessibility & UX Pillar (Axe-core WCAG + AI Code Fixes + Mobile + Multimodal Vision)
-        if opts.get("check_accessibility", True):
-            await ScanProgressTracker.log(run_id, "ACCESSIBILITY", "Starting Accessibility Pillar: Running Axe-core WCAG 2.1 AA rules and AI code fixes...", 85)
-            try:
-                a11y_scanner = AccessibilityScanner()
-                a11y_result = await a11y_scanner.scan(page, target_url, run_id=run_id)
-                active_pillars.append(a11y_result)
-                await ScanProgressTracker.log(run_id, "ACCESSIBILITY", f"Accessibility pillar completed (Score: {a11y_result.score}/100, Findings: {len(a11y_result.findings)})", 95)
-            except Exception as a_err:
-                await ScanProgressTracker.log(run_id, "ACCESSIBILITY", f"Accessibility pillar encountered error: {a_err}", 95, level="ERROR")
-                active_pillars.append(PillarScanResult(pillar=PillarType.ACCESSIBILITY, score=80.0, status="WARNING", findings=[]))
+        if profile["check_accessibility"]:
+            await ScanProgressTracker.log(run_id, "ACCESSIBILITY", "Starting Accessibility Pillar: Running Axe-core WCAG rules, responsive audits & AI visual review...", 85)
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+            a11y_result = await AccessibilityScanner().scan(
+                page,
+                target_url,
+                run_id=run_id,
+                comparison_paths=func_result.metrics.get("visual_comparison_paths", []),
+                crawl_result=crawl_result,
+            )
+            await ScanProgressTracker.log(run_id, "ACCESSIBILITY", f"Accessibility pillar completed (Score: {a11y_result.score}/100, Findings: {len(a11y_result.findings)})", 95)
+        else:
+            a11y_result = PillarScanResult(
+                pillar=PillarType.ACCESSIBILITY,
+                score=100.0,
+                status="SKIPPED",
+                metrics={"skipped": True, "reason": "disabled by scan profile"},
+            )
 
-        # Fallback if no pillars selected
-        if not active_pillars:
-            active_pillars.append(PillarScanResult(pillar=PillarType.FUNCTIONAL, score=100.0, status="PASSED"))
-
-        # Aggregate Pillars
+        # Aggregate 4 Pillars
         await ScanProgressTracker.log(run_id, "AGGREGATING", "Aggregating 4-pillar findings and generating deterministic report...", 97)
         unified_report = ReportAggregator.aggregate(
             run_id=run_id,
             target_url=target_url,
-            pillar_results=active_pillars
+            pillar_results=[func_result, sec_result, perf_result, a11y_result],
         )
 
         report_dict = unified_report.model_dump()
@@ -401,6 +374,9 @@ async def _async_execute_scan(
         return report_dict
 
     except asyncio.CancelledError:
+        current_task = asyncio.current_task()
+        if current_task and current_task.cancelling():
+            raise
         logger.info(f"Scan run {run_id} aborted due to cancellation.")
         await _persist_scan_failure(run_id, "Scan cancelled by user request", is_cancelled=True)
         return {"status": "CANCELLED", "run_id": run_id}
@@ -408,7 +384,44 @@ async def _async_execute_scan(
         await _persist_scan_failure(run_id, str(exc), is_cancelled=False)
         raise
     finally:
-        await context.close()
+        if context:
+            await context.close()
+
+async def _execute_with_timeout(
+    run_id: str,
+    target_url: str,
+    allowed_domains: List[str],
+    test_pack_yaml: Optional[str],
+    cookies: Optional[List[Dict[str, Any]]],
+    credentials: Optional[Dict[str, Any]],
+    options: Optional[Dict[str, Any]],
+    scan_profile: Optional[Dict[str, Any]],
+    timeout_seconds: int,
+) -> Dict[str, Any]:
+    from app.common.progress import ScanProgressTracker
+    try:
+        return await asyncio.wait_for(
+            _async_execute_scan(
+                run_id=run_id,
+                target_url=target_url,
+                allowed_domains=allowed_domains,
+                test_pack_yaml=test_pack_yaml,
+                cookies=cookies,
+                credentials=credentials,
+                options=options,
+                scan_profile=scan_profile,
+            ),
+            timeout=timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        err_msg = f"Scan exceeded its {timeout_seconds}-second timeout limit"
+        logger.error(f"Scan {run_id} failed: {err_msg}")
+        try:
+            await _persist_scan_failure(run_id, err_msg)
+            await ScanProgressTracker.log(run_id, "FAILED", err_msg, 100, level="ERROR")
+        except Exception as e:
+            logger.error(f"Error persisting scan failure for {run_id}: {e}")
+        return {"status": "FAILED", "run_id": run_id, "error": "scan_timeout"}
 
 @celery_app.task(bind=True, name="workers.tasks.run_scan.execute_website_scan")
 def execute_website_scan(
@@ -419,17 +432,24 @@ def execute_website_scan(
     test_pack_yaml: Optional[str] = None,
     cookies: Optional[List[Dict[str, Any]]] = None,
     credentials: Optional[Dict[str, Any]] = None,
-    options: Optional[Dict[str, Any]] = None
+    options: Optional[Dict[str, Any]] = None,
+    scan_profile: Optional[Dict[str, Any]] = None,
+    **kwargs: Any,
 ):
     """Celery task entrypoint."""
-    logger.info(f"Starting automated scan task for run {run_id} on {target_url}")
-    return asyncio.run(_async_execute_scan(
+    logger.info(f"Starting automated scan task for run {run_id} on {redact_url(target_url)}")
+    effective_profile = {**(options or {}), **(scan_profile or {})}
+    # Allow at least 300s (5 minutes) so that crawler + multi-step AI ReAct journey can complete
+    raw_timeout = int(effective_profile.get("timeout_seconds") or 300)
+    timeout_seconds = max(300, raw_timeout)
+    return asyncio.run(_execute_with_timeout(
         run_id=run_id,
         target_url=target_url,
         allowed_domains=allowed_domains,
         test_pack_yaml=test_pack_yaml,
         cookies=cookies,
         credentials=credentials,
-        options=options
+        options=options,
+        scan_profile=scan_profile,
+        timeout_seconds=timeout_seconds,
     ))
-
