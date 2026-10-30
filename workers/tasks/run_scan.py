@@ -45,11 +45,11 @@ async def _persist_scan_start(run_id: str) -> None:
     except Exception as e:
         logger.warning(f"Could not update start status for run {run_id}: {e}")
 
-async def _persist_scan_success(run_id: str, report_data: Dict[str, Any]) -> None:
-    """Save report summary and mark test run as completed."""
+async def _persist_scan_success(run_id: str, report_data: Dict[str, Any], artifacts: Optional[List[Dict[str, Any]]] = None) -> None:
+    """Save report summary, artifacts, and mark test run as completed."""
     try:
         from app.core.database import AsyncSessionLocal
-        from app.apps.test_runs.models import TestRun
+        from app.apps.test_runs.models import TestRun, RunArtifact
         from app.apps.reports.services import save_report
         from sqlalchemy import select
 
@@ -61,6 +61,18 @@ async def _persist_scan_success(run_id: str, report_data: Dict[str, Any]) -> Non
             if run:
                 run.status = RunStatus.COMPLETED
                 run.completed_at = datetime.now(timezone.utc)
+                if artifacts:
+                    for art in artifacts:
+                        abs_p = os.path.join(settings.STORAGE_DIR, art["relative_path"])
+                        size = os.path.getsize(abs_p) if os.path.exists(abs_p) else 0
+                        db.add(RunArtifact(
+                            test_run_id=run_id,
+                            artifact_type=art["artifact_type"],
+                            relative_path=art["relative_path"],
+                            file_name=art["file_name"],
+                            file_size_bytes=size,
+                            mime_type=art.get("mime_type", "application/octet-stream")
+                        ))
                 await db.commit()
     except Exception as e:
         logger.error(f"Failed to persist scan success for run {run_id}: {e}", exc_info=True)
@@ -205,17 +217,42 @@ async def _async_execute_scan(
     }
     creds = credentials or profile.get("credentials")
 
+    record_video = bool(profile.get("record_video", False))
+    record_trace = bool(profile.get("record_trace", True))
+    is_mobile = bool(profile.get("is_mobile", False))
+    browser_type = profile.get("browser_type", "chromium")
+
+    temp_video_dir = None
+    target_video_rel = f"videos/{run_id}.webm"
+    target_video_abs = os.path.join(settings.STORAGE_DIR, target_video_rel)
+    if record_video:
+        temp_video_dir = os.path.join(settings.STORAGE_DIR, "videos", f"temp_{run_id}")
+        os.makedirs(temp_video_dir, exist_ok=True)
+
+    target_trace_rel = f"traces/{run_id}_trace.zip"
+    target_trace_abs = os.path.join(settings.STORAGE_DIR, target_trace_rel)
+    os.makedirs(os.path.join(settings.STORAGE_DIR, "traces"), exist_ok=True)
+    os.makedirs(os.path.join(settings.STORAGE_DIR, "videos"), exist_ok=True)
+
     context = None
+    page = None
     try:
-        browser = await BrowserPool.get_browser()
-        await ScanProgressTracker.log(run_id, "INITIALIZING", "Created isolated Playwright browser context with ScopeGuard", 10)
+        browser = await BrowserPool.get_browser(browser_type=browser_type)
+        await ScanProgressTracker.log(run_id, "INITIALIZING", f"Created isolated Playwright {browser_type} context with ScopeGuard", 10)
         context = await ContextFactory.create_isolated_context(
             browser=browser,
             allowed_domains=set(allowed_domains),
             cookies=cookies,
+            viewport_width=profile.get("viewport_width"),
+            viewport_height=profile.get("viewport_height"),
             request_rate_limit=int(profile["rate_limit"]),
             target_url=target_url,
+            record_video_dir=temp_video_dir,
+            is_mobile=is_mobile,
         )
+        if record_trace:
+            await context.tracing.start(screenshots=True, snapshots=True, sources=True)
+
         await CoreWebVitalsScanner.install_observer(context)
         page = await context.new_page()
 
@@ -227,11 +264,12 @@ async def _async_execute_scan(
             await ScanProgressTracker.log(run_id, "AUTHENTICATING", f"Executing authentication flow on {creds.get('login_url', target_url)}", 12)
             await _perform_authentication(page, creds)
 
-        # Discover and visit safe, in-scope links before running site-wide audits.
+        # Discover and visit safe, in-scope links starting from landing URL (e.g., authenticated dashboard)
+        start_crawl_url = page.url if page.url and page.url != "about:blank" else target_url
         await ScanProgressTracker.log(run_id, "CRAWLING", "Crawling in-scope routes and analyzing site structure...", 15)
         crawl_result = await SiteCrawler.crawl(
             page,
-            target_url,
+            start_crawl_url,
             set(allowed_domains),
             max_pages=100,
             max_depth=5,
@@ -364,8 +402,42 @@ async def _async_execute_scan(
             pillar_results=[func_result, sec_result, perf_result, a11y_result],
         )
 
+        # Collect generated trace and video artifacts
+        artifacts: List[Dict[str, Any]] = []
+
+        if record_trace and context:
+            try:
+                await context.tracing.stop(path=target_trace_abs)
+                if os.path.exists(target_trace_abs) and os.path.getsize(target_trace_abs) > 0:
+                    artifacts.append({
+                        "artifact_type": "trace",
+                        "relative_path": target_trace_rel,
+                        "file_name": f"{run_id}_trace.zip",
+                        "mime_type": "application/zip",
+                    })
+            except Exception as trace_err:
+                logger.warning(f"Failed to stop/save Playwright trace for {run_id}: {trace_err}")
+
+        if record_video and page:
+            try:
+                video_obj = page.video
+                await page.close()
+                page = None
+                if video_obj:
+                    await video_obj.save_as(target_video_abs)
+                    if os.path.exists(target_video_abs) and os.path.getsize(target_video_abs) > 0:
+                        artifacts.append({
+                            "artifact_type": "video",
+                            "relative_path": target_video_rel,
+                            "file_name": f"{run_id}.webm",
+                            "mime_type": "video/webm",
+                        })
+            except Exception as vid_err:
+                logger.warning(f"Failed to save Playwright video for {run_id}: {vid_err}")
+
         report_dict = unified_report.model_dump()
-        await _persist_scan_success(run_id, report_dict)
+        report_dict["artifacts"] = {art["artifact_type"]: art["relative_path"] for art in artifacts}
+        await _persist_scan_success(run_id, report_dict, artifacts=artifacts)
         await ScanProgressTracker.log(
             run_id, "COMPLETED",
             f"Audit finished successfully! Overall Score: {unified_report.overall_score}/100, Grade: {unified_report.grade}",
@@ -384,8 +456,19 @@ async def _async_execute_scan(
         await _persist_scan_failure(run_id, str(exc), is_cancelled=False)
         raise
     finally:
+        if page:
+            try:
+                await page.close()
+            except Exception:
+                pass
         if context:
-            await context.close()
+            try:
+                await context.close()
+            except Exception:
+                pass
+        if temp_video_dir and os.path.exists(temp_video_dir):
+            import shutil
+            shutil.rmtree(temp_video_dir, ignore_errors=True)
 
 async def _execute_with_timeout(
     run_id: str,

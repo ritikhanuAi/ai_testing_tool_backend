@@ -425,7 +425,7 @@ class SiteCrawler:
                             await page.wait_for_load_state("load", timeout=load_wait_ms)
                         except Exception:
                             pass
-                    links, observations = await page.evaluate(
+                    eval_result = await page.evaluate(
                         """() => ({
                             links: Array.from(document.querySelectorAll('a[href]'))
                                 .map(anchor => anchor.href).filter(Boolean).slice(0, 500),
@@ -452,6 +452,8 @@ class SiteCrawler:
                             }
                         })"""
                     )
+                    observations = eval_result if isinstance(eval_result, dict) else {}
+                    links = observations.get("links", [])
                     observations["performance"] = await CoreWebVitalsScanner.collect_metrics(page)
                     observations["page"]["js_error_count"] = js_error_count[0]
                     observations["page"]["console_error_count"] = console_error_count[0]
@@ -472,7 +474,8 @@ class SiteCrawler:
                     links, cookies = [], []
                     final_url = current_url
                     error_code = re.search(r"net::ERR_[A-Z_]+", str(error))
-                    navigation_error = f"{type(error).__name__}: {error_code.group(0) if error_code else 'navigation failed'}"
+                    err_msg = str(error).splitlines()[0] if str(error) else 'navigation failed'
+                    navigation_error = f"{type(error).__name__}: {error_code.group(0) if error_code else err_msg}"
                 finally:
                     page.remove_listener("pageerror", on_page_error)
                     page.remove_listener("console", on_console)

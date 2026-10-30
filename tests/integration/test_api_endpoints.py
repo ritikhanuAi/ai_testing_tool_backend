@@ -311,4 +311,29 @@ def test_custom_scan_request_schema_validation():
     assert len(req3.cases) == 1
     assert req3.cases[0].id == "TC-03"
 
+def test_run_video_endpoint_not_found():
+    """Verify 404 is returned when video file does not exist."""
+    response = client.get("/api/v1/test-runs/nonexistent-run-id/video")
+    assert response.status_code == 404
+    payload = response.json()
+    assert payload["success"] is False
+    assert payload["error"]["code"] == "HTTP_404"
+
+def test_run_trace_endpoint_not_found():
+    """Verify 404 is returned when trace file does not exist."""
+    response = client.get("/api/v1/test-runs/nonexistent-run-id/trace")
+    assert response.status_code == 404
+    payload = response.json()
+    assert payload["success"] is False
+    assert payload["error"]["code"] == "HTTP_404"
+
+def test_run_artifacts_endpoint_empty():
+    """Verify artifacts list endpoint returns empty envelope when run has no artifacts."""
+    with patch("app.apps.test_runs.views.list_run_artifacts", new=AsyncMock(return_value=[])):
+        response = client.get("/api/v1/test-runs/nonexistent-run-id/artifacts")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["success"] is True
+        assert payload["data"] == []
+
 

@@ -27,7 +27,7 @@ async def lifespan(app: FastAPI):
         await conn.run_sync(Base.metadata.create_all)
 
     # Ensure storage evidence directories exist
-    for sub in ["screenshots", "traces", "logs", "exports"]:
+    for sub in ["screenshots", "traces", "logs", "exports", "videos"]:
         os.makedirs(os.path.join(settings.STORAGE_DIR, sub), exist_ok=True)
 
     yield

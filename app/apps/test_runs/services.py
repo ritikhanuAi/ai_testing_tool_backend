@@ -92,6 +92,27 @@ async def dispatch_quick_scan(db: AsyncSession, request_data: QuickScanRequest) 
             "auth_method": cred_payload.auth_method,
             "success_indicator": cred_payload.success_indicator
         }
+    elif website:
+        # Fallback to previously stored credentials for this website
+        cred_stmt = select(CredentialRef).where(
+            CredentialRef.website_id == website.id,
+            CredentialRef.key_name == "default_login"
+        )
+        c_res = await db.execute(cred_stmt)
+        existing_cred = c_res.scalar_one_or_none()
+        if existing_cred:
+            from app.core.security import decrypt_credential
+            try:
+                decrypted_pw = decrypt_credential(existing_cred.encrypted_secret)
+                credentials_dict = {
+                    "login_url": request_data.url,
+                    "username": existing_cred.username,
+                    "password": decrypted_pw,
+                    "auth_method": "form",
+                    "success_indicator": None
+                }
+            except Exception:
+                pass
 
     # 4. Resolve ScanProfile from options
     options_dict = request_data.options.model_dump() if request_data.options else {}
@@ -230,6 +251,27 @@ async def dispatch_custom_scan(db: AsyncSession, request_data: CustomScanRequest
             "auth_method": cred_payload.auth_method,
             "success_indicator": cred_payload.success_indicator
         }
+    elif website:
+        # Fallback to previously stored credentials for this website
+        cred_stmt = select(CredentialRef).where(
+            CredentialRef.website_id == website.id,
+            CredentialRef.key_name == "default_login"
+        )
+        c_res = await db.execute(cred_stmt)
+        existing_cred = c_res.scalar_one_or_none()
+        if existing_cred:
+            from app.core.security import decrypt_credential
+            try:
+                decrypted_pw = decrypt_credential(existing_cred.encrypted_secret)
+                credentials_dict = {
+                    "login_url": request_data.url,
+                    "username": existing_cred.username,
+                    "password": decrypted_pw,
+                    "auth_method": "form",
+                    "success_indicator": None
+                }
+            except Exception:
+                pass
 
     # 4. Serialize cases to TestPack
     import yaml
@@ -419,6 +461,27 @@ async def dispatch_scan_run(db: AsyncSession, request_data: TriggerScanRequest) 
     await db.refresh(test_run)
 
     # 4. Enqueue Celery task asynchronously
+    credentials_dict = None
+    cred_stmt = select(CredentialRef).where(
+        CredentialRef.website_id == website.id,
+        CredentialRef.key_name == "default_login"
+    )
+    c_res = await db.execute(cred_stmt)
+    existing_cred = c_res.scalar_one_or_none()
+    if existing_cred:
+        from app.core.security import decrypt_credential
+        try:
+            decrypted_pw = decrypt_credential(existing_cred.encrypted_secret)
+            credentials_dict = {
+                "login_url": website.base_url,
+                "username": existing_cred.username,
+                "password": decrypted_pw,
+                "auth_method": "form",
+                "success_indicator": None
+            }
+        except Exception:
+            pass
+
     try:
         from workers.tasks.run_scan import execute_website_scan
         task = execute_website_scan.delay(
@@ -427,6 +490,7 @@ async def dispatch_scan_run(db: AsyncSession, request_data: TriggerScanRequest) 
             allowed_domains=website.allowed_domains,
             test_pack_yaml=raw_yaml,
             scan_profile=profile_payload,
+            credentials=credentials_dict,
         )
         test_run.celery_task_id = task.id
         await db.commit()

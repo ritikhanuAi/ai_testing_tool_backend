@@ -6,7 +6,8 @@ from app.apps.websites.serializers import WebsiteAnalyzeResponse
 from app.apps.websites.views import analyze_website_view
 from app.apps.test_runs.views import (
     list_runs_view, trigger_scan_view, get_run_view, cancel_run_view, quick_scan_view,
-    get_run_logs_view, execute_custom_scan_view
+    get_run_logs_view, execute_custom_scan_view, get_run_video_view, get_run_trace_view,
+    get_run_artifacts_view
 )
 
 router = APIRouter(prefix="/test-runs", tags=["Test Runs"])
@@ -18,6 +19,9 @@ router.post("/execute-custom", response_model=ResponseEnvelope[TestRunResponse],
 router.post("/analyze-url", response_model=ResponseEnvelope[WebsiteAnalyzeResponse], summary="Analyze Website URL for Testing Requirements")(analyze_website_view)
 router.get("/{run_id}", response_model=ResponseEnvelope[TestRunResponse], summary="Get Test Run By ID")(get_run_view)
 router.get("/{run_id}/logs", summary="Get Live Test Run Console Logs & Stage Progress")(get_run_logs_view)
+router.get("/{run_id}/video", summary="Stream or Download Test Run Video Recording")(get_run_video_view)
+router.get("/{run_id}/trace", summary="Download Playwright Trace File")(get_run_trace_view)
+router.get("/{run_id}/artifacts", response_model=ResponseEnvelope[List[dict]], summary="List Test Run Artifacts")(get_run_artifacts_view)
 router.post("/{run_id}/cancel", response_model=ResponseEnvelope[TestRunResponse], summary="Cancel Active Test Run")(cancel_run_view)
 
 
