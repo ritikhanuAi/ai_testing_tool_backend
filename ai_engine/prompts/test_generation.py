@@ -36,6 +36,17 @@ Supported assertions: element_visible, element_hidden, text_contains, text_equal
 Output ONLY raw JSON with NO markdown formatting or commentary.
 """
 
+def build_case_generation_prompt(page_description: str, form_fields: str = "") -> str:
+    """Constructs a security-sandboxed prompt for generating test cases."""
+    fields_clause = f"\nDetected Form Fields:\n{form_fields}\n" if form_fields else ""
+    return f"""Target Page & Context:
+<untrusted_page_context>
+{page_description}
+{fields_clause}</untrusted_page_context>
+
+Generate a high-value automated test case JSON object matching the TestCaseModel schema.
+"""
+
 class AITestCaseGenerator:
     """Generates comprehensive functional test suites combining AI synthesis with standard edge cases."""
 

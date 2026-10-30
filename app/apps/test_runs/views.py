@@ -3,8 +3,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List, Optional
 from app.core.database import get_db
 from app.common.serializers import ResponseEnvelope
-from app.apps.test_runs.serializers import TriggerScanRequest, TestRunResponse, QuickScanRequest
-from app.apps.test_runs.services import dispatch_scan_run, dispatch_quick_scan
+from app.apps.test_runs.serializers import TriggerScanRequest, TestRunResponse, QuickScanRequest, CustomScanRequest
+from app.apps.test_runs.services import dispatch_scan_run, dispatch_quick_scan, dispatch_custom_scan
 from app.apps.test_runs.selectors import list_test_runs, get_test_run_by_id
 
 async def quick_scan_view(
@@ -15,6 +15,17 @@ async def quick_scan_view(
     run = await dispatch_quick_scan(db, data)
     return ResponseEnvelope(
         message="Autonomous AI scan successfully queued",
+        data=TestRunResponse.model_validate(run)
+    )
+
+async def execute_custom_scan_view(
+    data: CustomScanRequest,
+    db: AsyncSession = Depends(get_db)
+) -> ResponseEnvelope[TestRunResponse]:
+    """Execute custom structured JSON test suite via Playwright with optional pillar audits and AI diagnosis."""
+    run = await dispatch_custom_scan(db, data)
+    return ResponseEnvelope(
+        message="Custom test run queued successfully",
         data=TestRunResponse.model_validate(run)
     )
 
@@ -62,4 +73,15 @@ async def cancel_run_view(
     return ResponseEnvelope(
         message="Test run cancellation signal sent",
         data=TestRunResponse.model_validate(run)
+    )
+
+async def get_run_logs_view(
+    run_id: str
+) -> ResponseEnvelope[dict]:
+    """Retrieve real-time console logs, execution stage, and progress percentage for active or completed scan."""
+    from app.common.progress import ScanProgressTracker
+    progress = await ScanProgressTracker.get_progress(run_id)
+    return ResponseEnvelope(
+        message="Scan progress and execution console logs retrieved",
+        data=progress
     )

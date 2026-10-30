@@ -1,0 +1,163 @@
+{
+  "cases": [
+    {
+      "id": "TC-DEMOQA-001",
+      "title": "Verify Form Input Echo on DemoQA Text Box",
+      "pillar": "functional",
+      "risk": "read_only",
+      "tags": ["smoke", "forms", "demoqa"],
+      "preconditions": ["clean_session"],
+      "steps": [
+        {
+          "action": "open_page",
+          "value": "https://demoqa.com/text-box",
+          "description": "Navigate to the DemoQA Text Box form"
+        },
+        {
+          "action": "wait",
+          "timeout_ms": 1000,
+          "description": "Allow page DOM and JavaScript to hydrate"
+        },
+        {
+          "action": "type_text",
+          "target": "#userName",
+          "value": "Jane Doe",
+          "description": "Enter full name into user name field"
+        },
+        {
+          "action": "type_text",
+          "target": "#userEmail",
+          "value": "jane.doe@example.com",
+          "description": "Enter valid email address"
+        },
+        {
+          "action": "type_text",
+          "target": "#currentAddress",
+          "value": "123 Tech Park Ave, Suite 400",
+          "description": "Enter current address"
+        },
+        {
+          "action": "scroll",
+          "target": "#submit",
+          "description": "Scroll down to make submit button visible"
+        },
+        {
+          "action": "click",
+          "target": "#submit",
+          "description": "Click submit button"
+        }
+      ],
+      "assertions": [
+        {
+          "type": "element_visible",
+          "target": "#output",
+          "description": "Verify submission output box is rendered"
+        },
+        {
+          "type": "text_contains",
+          "target": "#output #name",
+          "value": "Jane Doe",
+          "description": "Verify submitted full name is correctly echoed"
+        },
+        {
+          "type": "text_contains",
+          "target": "#output #email",
+          "value": "jane.doe@example.com",
+          "description": "Verify submitted email is correctly echoed"
+        }
+      ]
+    },
+    {
+      "id": "TC-VALIDATION-002",
+      "title": "Verify Form Validation Blocks Invalid Email",
+      "pillar": "functional",
+      "risk": "read_only",
+      "tags": ["validation", "negative"],
+      "preconditions": [],
+      "steps": [
+        {
+          "action": "open_page",
+          "value": "https://demoqa.com/text-box",
+          "description": "Open Text Box page"
+        },
+        {
+          "action": "type_text",
+          "target": "#userName",
+          "value": "Test User",
+          "description": "Fill name"
+        },
+        {
+          "action": "type_text",
+          "target": "#userEmail",
+          "value": "invalid-email-format@",
+          "description": "Input malformed email"
+        },
+        {
+          "action": "scroll",
+          "target": "#submit",
+          "description": "Scroll to submit button"
+        },
+        {
+          "action": "click",
+          "target": "#submit",
+          "description": "Attempt form submission"
+        }
+      ],
+      "assertions": [
+        {
+          "type": "element_visible",
+          "target": "input#userEmail.field-error",
+          "description": "Verify field error class is attached to email input"
+        },
+        {
+          "type": "element_hidden",
+          "target": "#output #name",
+          "description": "Verify output box is not populated on invalid submission"
+        }
+      ]
+    },
+    {
+      "id": "TC-NAV-003",
+      "title": "Verify Page Title and Header Navigation",
+      "pillar": "functional",
+      "risk": "read_only",
+      "tags": ["navigation", "smoke"],
+      "preconditions": [],
+      "steps": [
+        {
+          "action": "open_page",
+          "value": "https://example.com",
+          "description": "Navigate to home page"
+        },
+        {
+          "action": "wait",
+          "timeout_ms": 500,
+          "description": "Wait briefly for network idle"
+        }
+      ],
+      "assertions": [
+        {
+          "type": "status_code_equals",
+          "value": 200,
+          "description": "Verify HTTP 200 status code response"
+        },
+        {
+          "type": "page_title_contains",
+          "value": "Example Domain",
+          "description": "Verify page title matches"
+        },
+        {
+          "type": "element_visible",
+          "target": "h1",
+          "description": "Verify main header is visible"
+        },
+        {
+          "type": "text_contains",
+          "target": "h1",
+          "value": "Example Domain",
+          "description": "Verify header text content"
+        }
+      ]
+    }
+  ]
+}

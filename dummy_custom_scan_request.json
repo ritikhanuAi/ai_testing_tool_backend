@@ -1,0 +1,74 @@
+{
+  "url": "https://demoqa.com",
+  "name": "DemoQA Regression Suite",
+  "credentials": {
+    "enabled": false
+  },
+  "options": {
+    "check_functional": true,
+    "check_security": false,
+    "check_performance": false,
+    "check_accessibility": false,
+    "browser_type": "chromium",
+    "timeout_seconds": 180,
+    "allow_state_changing": false,
+    "ai_explain_failures": true
+  },
+  "cases": [
+    {
+      "id": "TC-DEMOQA-001",
+      "title": "Verify Form Input Echo on DemoQA Text Box",
+      "pillar": "functional",
+      "risk": "read_only",
+      "tags": ["smoke", "forms", "demoqa"],
+      "preconditions": ["clean_session"],
+      "steps": [
+        {
+          "action": "open_page",
+          "value": "https://demoqa.com/text-box",
+          "description": "Navigate to the DemoQA Text Box form"
+        },
+        {
+          "action": "wait",
+          "timeout_ms": 1000,
+          "description": "Allow page DOM and JavaScript to hydrate"
+        },
+        {
+          "action": "type_text",
+          "target": "#userName",
+          "value": "Jane Doe",
+          "description": "Enter full name into user name field"
+        },
+        {
+          "action": "type_text",
+          "target": "#userEmail",
+          "value": "jane.doe@example.com",
+          "description": "Enter valid email address"
+        },
+        {
+          "action": "scroll",
+          "target": "#submit",
+          "description": "Scroll down to make submit button visible"
+        },
+        {
+          "action": "click",
+          "target": "#submit",
+          "description": "Click submit button"
+        }
+      ],
+      "assertions": [
+        {
+          "type": "element_visible",
+          "target": "#output",
+          "description": "Verify submission output box is rendered"
+        },
+        {
+          "type": "text_contains",
+          "target": "#output #name",
+          "value": "Jane Doe",
+          "description": "Verify submitted full name is correctly echoed"
+        }
+      ]
+    }
+  ]
+}

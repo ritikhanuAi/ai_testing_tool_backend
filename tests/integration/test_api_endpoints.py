@@ -169,4 +169,146 @@ def test_analyze_website_ssrf_blocked():
     assert payload["error"]["code"] == "SCOPE_VIOLATION"
     assert "target scope" in payload["error"]["message"].lower() or "protected" in payload["error"]["message"].lower()
 
+def test_get_run_logs_endpoint():
+    """Verify GET /api/v1/test-runs/{run_id}/logs returns envelope with progress structure."""
+    response = client.get("/api/v1/test-runs/test-run-123/logs")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["success"] is True
+    data = payload["data"]
+    assert data["run_id"] == "test-run-123"
+    assert "stage" in data
+    assert "progress" in data
+    assert "logs" in data
+    assert isinstance(data["logs"], list)
+
+def test_execute_custom_scan_with_array():
+    """Verify POST /api/v1/test-runs/execute-custom accepts direct cases array."""
+    custom_payload = {
+        "url": "https://example.com",
+        "name": "Custom Test Suite Array",
+        "options": {
+            "check_functional": True,
+            "check_security": False
+        },
+        "cases": [
+            {
+                "id": "TC-001",
+                "title": "Home navigation",
+                "steps": [
+                    {"action": "open_page", "value": "https://example.com"},
+                    {"action": "wait", "timeout_ms": 500}
+                ],
+                "assertions": [
+                    {"type": "url_contains", "value": "example.com"}
+                ]
+            }
+        ]
+    }
+    mock_run = {
+        "id": "run-custom-uuid-1",
+        "website_id": "site-test-uuid-1",
+        "scan_profile_id": "profile-test-uuid-1",
+        "test_pack_id": "pack-test-uuid-1",
+        "status": "queued",
+        "celery_task_id": "celery-mock-task-1",
+        "overall_score": None,
+        "grade": None,
+        "started_at": "2026-10-23T12:00:00Z",
+        "completed_at": None,
+        "error_message": None
+    }
+    with patch("app.apps.test_runs.views.dispatch_custom_scan", new=AsyncMock(return_value=mock_run)):
+        response = client.post("/api/v1/test-runs/execute-custom", json=custom_payload)
+        assert response.status_code == 202
+        body = response.json()
+        assert body["success"] is True
+        assert body["data"]["status"] == "queued"
+        assert body["data"]["id"] == "run-custom-uuid-1"
+
+def test_execute_custom_scan_with_nested_dict():
+    """Verify POST /api/v1/test-runs/execute-custom accepts cases as {'cases': [...]}."""
+    custom_payload = {
+        "url": "https://example.com",
+        "name": "Custom Test Suite Dict",
+        "cases": {
+            "cases": [
+                {
+                    "id": "TC-002",
+                    "title": "Search test",
+                    "steps": [
+                        {"action": "open_page", "value": "https://example.com"}
+                    ],
+                    "assertions": [
+                        {"type": "page_title_contains", "value": "Example"}
+                    ]
+                }
+            ]
+        }
+    }
+    mock_run = {
+        "id": "run-custom-uuid-2",
+        "website_id": "site-test-uuid-2",
+        "scan_profile_id": "profile-test-uuid-2",
+        "test_pack_id": "pack-test-uuid-2",
+        "status": "queued",
+        "celery_task_id": "celery-mock-task-2",
+        "overall_score": None,
+        "grade": None,
+        "started_at": "2026-10-23T12:00:00Z",
+        "completed_at": None,
+        "error_message": None
+    }
+    with patch("app.apps.test_runs.views.dispatch_custom_scan", new=AsyncMock(return_value=mock_run)):
+        response = client.post("/api/v1/test-runs/execute-custom", json=custom_payload)
+        assert response.status_code == 202
+        body = response.json()
+        assert body["success"] is True
+        assert body["data"]["status"] == "queued"
+
+def test_custom_scan_request_schema_validation():
+    """Verify CustomScanRequest Pydantic validator handles array, dict, and stringified JSON."""
+    from app.apps.test_runs.serializers import CustomScanRequest
+
+    # 1. Direct List
+    req1 = CustomScanRequest(
+        url="https://example.com",
+        cases=[
+            {
+                "id": "TC-01",
+                "title": "Test 1",
+                "steps": [{"action": "open_page", "value": "https://example.com"}],
+                "assertions": []
+            }
+        ]
+    )
+    assert len(req1.cases) == 1
+    assert req1.cases[0].id == "TC-01"
+
+    # 2. Dict with 'cases' key: {"cases": [...]}
+    req2 = CustomScanRequest(
+        url="https://example.com",
+        cases={
+            "cases": [
+                {
+                    "id": "TC-02",
+                    "title": "Test 2",
+                    "steps": [{"action": "open_page", "value": "https://example.com"}],
+                    "assertions": []
+                }
+            ]
+        }
+    )
+    assert len(req2.cases) == 1
+    assert req2.cases[0].id == "TC-02"
+
+    # 3. Stringified JSON from file upload
+    json_str = '{"cases": [{"id": "TC-03", "title": "Test 3", "steps": [{"action": "open_page", "value": "https://example.com"}], "assertions": []}]}'
+    req3 = CustomScanRequest(
+        url="https://example.com",
+        cases=json_str
+    )
+    assert len(req3.cases) == 1
+    assert req3.cases[0].id == "TC-03"
+
 

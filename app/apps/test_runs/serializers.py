@@ -1,8 +1,11 @@
-from pydantic import BaseModel, Field, HttpUrl
-from typing import Optional, List
+import json
+import yaml
+from pydantic import BaseModel, Field, HttpUrl, field_validator
+from typing import Optional, List, Any, Union
 from datetime import datetime
 from app.common.serializers import BaseSchema
 from app.common.constants import RunStatus
+from test_engine.schema.case import TestCaseModel
 
 class AuthenticationPayload(BaseModel):
     enabled: bool = False
@@ -44,6 +47,36 @@ class QuickScanRequest(BaseModel):
     name: Optional[str] = Field(default=None, description="Optional website label")
     credentials: Optional[AuthenticationPayload] = None
     options: Optional[AdvancedExecutionOptions] = Field(default_factory=AdvancedExecutionOptions)
+
+class CustomScanRequest(BaseModel):
+    url: str = Field(..., description="Target website entry URL (e.g. https://example.com)")
+    name: Optional[str] = Field(default=None, description="Optional suite or website label")
+    credentials: Optional[AuthenticationPayload] = None
+    options: Optional[AdvancedExecutionOptions] = Field(default_factory=AdvancedExecutionOptions)
+    cases: List[TestCaseModel] = Field(..., min_length=1, description="List of structured test cases to execute")
+
+    @field_validator("cases", mode="before")
+    @classmethod
+    def normalize_cases(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            try:
+                v = json.loads(v)
+            except Exception:
+                try:
+                    v = yaml.safe_load(v)
+                except Exception as e:
+                    raise ValueError(f"Could not parse cases JSON/YAML string: {e}")
+
+        if isinstance(v, dict):
+            if "cases" in v and isinstance(v["cases"], list):
+                v = v["cases"]
+            else:
+                raise ValueError("Dictionary must contain a 'cases' list.")
+
+        if not isinstance(v, list) or len(v) == 0:
+            raise ValueError("Must provide at least one test case in 'cases' list.")
+
+        return v
 
 class TriggerScanRequest(BaseModel):
     website_id: str
