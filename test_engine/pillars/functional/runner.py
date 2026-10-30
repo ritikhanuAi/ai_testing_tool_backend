@@ -24,6 +24,15 @@ logger = logging.getLogger("test_engine.pillars.functional.runner")
 MAX_REACT_ACTIONS = 5
 
 
+async def _emit_progress(run_id: str, stage: str, message: str, progress: int, level: str = "INFO") -> None:
+    """Safely emit execution telemetry to Redis without coupling test_engine to external systems."""
+    try:
+        from app.common.progress import ScanProgressTracker
+        await ScanProgressTracker.log(run_id, stage, message, progress, level)
+    except Exception:
+        pass
+
+
 class FunctionalScanner(BasePillarScanner):
     """Run authored or deterministic checks, then a bounded observe-act-observe journey."""
 
@@ -68,6 +77,8 @@ class FunctionalScanner(BasePillarScanner):
         cases = list(test_cases or [])
         if not supplied_cases:
             cases = await AITestCaseGenerator.generate_suite_for_forms(forms, target_url)
+            if forms:
+                await _emit_progress(run_id, "FUNCTIONAL", f"Extracted {len(forms)} form(s) from page and synthesized {len(cases)} test scenario(s)", 27)
 
         allow_state_changing = bool(kwargs.get("allow_state_changing", False))
         executed_cases = 0
@@ -75,23 +86,38 @@ class FunctionalScanner(BasePillarScanner):
         skipped_cases = 0
         downloaded_files: List[Dict[str, Any]] = []
         visual_comparison_paths: List[str] = []
+        executed_case_records: List[Dict[str, Any]] = []
 
-        for case in cases:
+        for case_idx, case in enumerate(cases):
             permitted, _ = RiskPolicyChecker.is_execution_permitted(case, allow_state_changing)
             if not permitted:
                 skipped_cases += 1
+                await _emit_progress(run_id, "FUNCTIONAL", f"Skipping state-changing case [{case.id}] (read-only mode)", 28)
                 continue
 
             executed_cases += 1
             case_passed = True
             case_server_error_start = len(server_error_statuses)
-            for step in case.steps:
+            await _emit_progress(run_id, "FUNCTIONAL", f"Executing Test Scenario ({case_idx + 1}/{len(cases)}): {case.title}", 28 + min(12, case_idx * 3))
+
+            step_records: List[Dict[str, Any]] = []
+            for step_idx, step in enumerate(case.steps):
+                tgt_info = f" on '{step.target}'" if step.target else ""
+                val_info = f" with '{step.value}'" if step.value else ""
+                await _emit_progress(run_id, "FUNCTIONAL", f"  ↳ [Step {step_idx + 1}/{len(case.steps)}] {step.action.value}{tgt_info}{val_info}", 28 + min(12, case_idx * 3))
                 if not visual_comparison_paths and step.action != ActionType.OPEN_PAGE:
                     before_path, _ = await EvidenceCollector.capture_screenshot_bytes(
                         page, run_id, f"{case.id}-BEFORE", full_page=False
                     )
                     visual_comparison_paths.append(before_path)
                 step_result = await ActionRunner.execute_step(page, step)
+                step_records.append({
+                    "action": step.action.value,
+                    "target": step.target,
+                    "value": step.value,
+                    "status": step_result.get("status", "PASSED"),
+                    "error": step_result.get("error"),
+                })
                 if step_result.get("download_path"):
                     downloaded_files.append({
                         "test_case_id": case.id,
@@ -115,6 +141,7 @@ class FunctionalScanner(BasePillarScanner):
                         selector_or_url=redact_text(step.target or ""),
                         suggested_fix="Check the accessible control name, selector, and current page state.",
                     ))
+                    await _emit_progress(run_id, "FUNCTIONAL", f"  ✗ Action '{step.action.value}' failed: {step_result.get('error')}", 30, level="WARNING")
                     break
 
             if case_passed:
@@ -125,6 +152,8 @@ class FunctionalScanner(BasePillarScanner):
                         last_status_code=last_status_code[0],
                         server_error_statuses=server_error_statuses[case_server_error_start:],
                     )
+                    assert_status = "PASSED" if result.get("passed", False) else "FAILED"
+                    await _emit_progress(run_id, "FUNCTIONAL", f"  ↳ [Assert] {assertion.type.value} -> {assert_status}", 34)
                     if not result.get("passed", False):
                         case_passed = False
                         screenshot_path = await EvidenceCollector.capture_screenshot(page, run_id, case.id)
@@ -141,6 +170,17 @@ class FunctionalScanner(BasePillarScanner):
 
             if case_passed:
                 passed_cases += 1
+                await _emit_progress(run_id, "FUNCTIONAL", f"  ✓ Scenario [{case.id}] passed", 36)
+
+            executed_case_records.append({
+                "id": case.id,
+                "title": case.title,
+                "pillar": case.pillar.value if hasattr(case.pillar, "value") else str(case.pillar),
+                "risk": case.risk.value if hasattr(case.risk, "value") else str(case.risk),
+                "steps": step_records,
+                "assertions_count": len(case.assertions),
+                "passed": case_passed,
+            })
 
         react_actions = 0
         react_completed = False
@@ -308,6 +348,7 @@ class FunctionalScanner(BasePillarScanner):
                 "passed_cases": passed_cases,
                 "failed_cases": executed_cases - passed_cases,
                 "skipped_cases": skipped_cases,
+                "executed_test_cases": executed_case_records,
                 "forms_discovered": len(forms),
                 "interactive_elements_discovered": len(catalog),
                 "react_actions": react_actions,

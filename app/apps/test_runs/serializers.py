@@ -29,6 +29,8 @@ class AdvancedExecutionOptions(BaseModel):
     is_mobile: bool = False
     record_trace: bool = True           # Saves Playwright trace.zip
     record_video: bool = False
+    headless: bool = True               # False = opens visible desktop browser window
+    slow_mo_ms: int = 0                 # Delay per Playwright action in ms for visual debugging
 
     # Safety Guardrails & Rate Limits
     allow_state_changing: bool = False  # False = Read-only mode (blocks destructive actions)
@@ -82,6 +84,7 @@ class TriggerScanRequest(BaseModel):
     website_id: str
     scan_profile_id: Optional[str] = None
     test_pack_id: Optional[str] = None
+    advanced_options: Optional[AdvancedExecutionOptions] = None
 
 class TestRunResponse(BaseSchema):
     id: str

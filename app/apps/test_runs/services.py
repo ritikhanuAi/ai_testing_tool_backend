@@ -114,40 +114,39 @@ async def dispatch_quick_scan(db: AsyncSession, request_data: QuickScanRequest) 
             except Exception:
                 pass
 
-    # 4. Resolve ScanProfile from options
+    # 4. Create run-specific ScanProfile from options
     options_dict = request_data.options.model_dump() if request_data.options else {}
-    profile_stmt = select(ScanProfile).where(ScanProfile.name == "Quick Scan Profile")
-    p_res = await db.execute(profile_stmt)
-    scan_profile = p_res.scalar_one_or_none()
+    scan_profile = ScanProfile(
+        name=f"Quick Scan - {website.name} ({datetime.now(timezone.utc).strftime('%H:%M:%S')})",
+        description="Auto-generated scan profile for quick autonomous scans",
+        check_functional=bool(options_dict.get("check_functional", True)),
+        check_security=bool(options_dict.get("check_security", True)),
+        check_performance=bool(options_dict.get("check_performance", True)),
+        check_accessibility=bool(options_dict.get("check_accessibility", True)),
+        allow_state_changing=bool(options_dict.get("allow_state_changing", False)),
+        rate_limit=int(options_dict.get("rate_limit_rps", 10)),
+        timeout_seconds=int(options_dict.get("timeout_seconds", 300)),
+        browser_type=str(options_dict.get("browser_type", "chromium")),
+        viewport_width=int(options_dict.get("viewport_width", 1280)),
+        viewport_height=int(options_dict.get("viewport_height", 720))
+    )
+    db.add(scan_profile)
+    await db.flush()
 
-    if scan_profile:
-        scan_profile.check_functional = options_dict.get("check_functional", True)
-        scan_profile.check_security = options_dict.get("check_security", True)
-        scan_profile.check_performance = options_dict.get("check_performance", True)
-        scan_profile.check_accessibility = options_dict.get("check_accessibility", True)
-        scan_profile.allow_state_changing = options_dict.get("allow_state_changing", False)
-        scan_profile.rate_limit = options_dict.get("rate_limit_rps", 10)
-        scan_profile.timeout_seconds = options_dict.get("timeout_seconds", 300)
-        scan_profile.browser_type = options_dict.get("browser_type", "chromium")
-        scan_profile.viewport_width = options_dict.get("viewport_width", 1280)
-        scan_profile.viewport_height = options_dict.get("viewport_height", 720)
-    else:
-        scan_profile = ScanProfile(
-            name="Quick Scan Profile",
-            description="Auto-generated scan profile for quick autonomous scans",
-            check_functional=options_dict.get("check_functional", True),
-            check_security=options_dict.get("check_security", True),
-            check_performance=options_dict.get("check_performance", True),
-            check_accessibility=options_dict.get("check_accessibility", True),
-            allow_state_changing=options_dict.get("allow_state_changing", False),
-            rate_limit=options_dict.get("rate_limit_rps", 10),
-            timeout_seconds=options_dict.get("timeout_seconds", 300),
-            browser_type=options_dict.get("browser_type", "chromium"),
-            viewport_width=options_dict.get("viewport_width", 1280),
-            viewport_height=options_dict.get("viewport_height", 720)
-        )
-        db.add(scan_profile)
-        await db.flush()
+    profile_payload = {
+        "check_functional": scan_profile.check_functional,
+        "check_security": scan_profile.check_security,
+        "check_performance": scan_profile.check_performance,
+        "check_accessibility": scan_profile.check_accessibility,
+        "allow_state_changing": scan_profile.allow_state_changing,
+        "rate_limit": scan_profile.rate_limit,
+        "timeout_seconds": scan_profile.timeout_seconds,
+        "browser_type": scan_profile.browser_type,
+        "viewport_width": scan_profile.viewport_width,
+        "viewport_height": scan_profile.viewport_height,
+        "headless": options_dict.get("headless", True),
+        "slow_mo_ms": options_dict.get("slow_mo_ms", 0),
+    }
 
     # 5. Create TestRun record
     test_run = TestRun(
@@ -169,6 +168,7 @@ async def dispatch_quick_scan(db: AsyncSession, request_data: QuickScanRequest) 
             allowed_domains=website.allowed_domains,
             test_pack_yaml=None,
             credentials=credentials_dict,
+            scan_profile=profile_payload,
             options=options_dict
         )
         test_run.celery_task_id = task.id
@@ -352,8 +352,20 @@ async def dispatch_custom_scan(db: AsyncSession, request_data: CustomScanRequest
             viewport_width=options_dict.get("viewport_width", 1280),
             viewport_height=options_dict.get("viewport_height", 720)
         )
-        db.add(scan_profile)
-        await db.flush()
+    profile_payload = {
+        "check_functional": scan_profile.check_functional,
+        "check_security": scan_profile.check_security,
+        "check_performance": scan_profile.check_performance,
+        "check_accessibility": scan_profile.check_accessibility,
+        "allow_state_changing": scan_profile.allow_state_changing,
+        "rate_limit": scan_profile.rate_limit,
+        "timeout_seconds": scan_profile.timeout_seconds,
+        "browser_type": scan_profile.browser_type,
+        "viewport_width": scan_profile.viewport_width,
+        "viewport_height": scan_profile.viewport_height,
+        "headless": options_dict.get("headless", True),
+        "slow_mo_ms": options_dict.get("slow_mo_ms", 0),
+    }
 
     # 6. Create TestRun record
     test_run = TestRun(
@@ -376,6 +388,7 @@ async def dispatch_custom_scan(db: AsyncSession, request_data: CustomScanRequest
             allowed_domains=website.allowed_domains,
             test_pack_yaml=pack_yaml_str,
             credentials=credentials_dict,
+            scan_profile=profile_payload,
             options=options_dict
         )
         test_run.celery_task_id = task.id
@@ -431,6 +444,9 @@ async def dispatch_scan_run(db: AsyncSession, request_data: TriggerScanRequest) 
             "allow_state_changing": profile.allow_state_changing,
             "rate_limit": profile.rate_limit,
             "timeout_seconds": profile.timeout_seconds,
+            "browser_type": profile.browser_type,
+            "viewport_width": profile.viewport_width,
+            "viewport_height": profile.viewport_height,
         }
     else:
         profile_payload = {
@@ -441,6 +457,9 @@ async def dispatch_scan_run(db: AsyncSession, request_data: TriggerScanRequest) 
             "allow_state_changing": False,
             "rate_limit": 10,
             "timeout_seconds": 900,
+            "browser_type": "chromium",
+            "viewport_width": 1280,
+            "viewport_height": 720,
         }
 
     if not any(profile_payload[key] for key in (
@@ -482,6 +501,11 @@ async def dispatch_scan_run(db: AsyncSession, request_data: TriggerScanRequest) 
         except Exception:
             pass
 
+    options_dict = request_data.advanced_options.model_dump() if request_data.advanced_options else {}
+    if options_dict:
+        profile_payload["headless"] = options_dict.get("headless", True)
+        profile_payload["slow_mo_ms"] = options_dict.get("slow_mo_ms", 0)
+
     try:
         from workers.tasks.run_scan import execute_website_scan
         task = execute_website_scan.delay(
@@ -491,6 +515,7 @@ async def dispatch_scan_run(db: AsyncSession, request_data: TriggerScanRequest) 
             test_pack_yaml=raw_yaml,
             scan_profile=profile_payload,
             credentials=credentials_dict,
+            options=options_dict,
         )
         test_run.celery_task_id = task.id
         await db.commit()

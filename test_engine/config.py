@@ -12,5 +12,6 @@ class EngineConfig(BaseModel):
     user_agent: str = "AITestingPlatform/1.0 (+https://example.com/bot)"
     trace_on_failure: bool = True
     screenshot_on_failure: bool = True
+    slow_mo_ms: int = 0
 
 default_engine_config = EngineConfig()

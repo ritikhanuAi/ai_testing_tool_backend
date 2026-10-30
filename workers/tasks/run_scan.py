@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import os
+import shutil
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -232,13 +234,19 @@ async def _async_execute_scan(
     target_trace_rel = f"traces/{run_id}_trace.zip"
     target_trace_abs = os.path.join(settings.STORAGE_DIR, target_trace_rel)
     os.makedirs(os.path.join(settings.STORAGE_DIR, "traces"), exist_ok=True)
-    os.makedirs(os.path.join(settings.STORAGE_DIR, "videos"), exist_ok=True)
+    headless = bool(profile.get("headless", True))
+    slow_mo_ms = int(profile.get("slow_mo_ms", 0 if headless else 300))
 
     context = None
     page = None
     try:
-        browser = await BrowserPool.get_browser(browser_type=browser_type)
-        await ScanProgressTracker.log(run_id, "INITIALIZING", f"Created isolated Playwright {browser_type} context with ScopeGuard", 10)
+        browser = await BrowserPool.get_browser(
+            browser_type=browser_type,
+            headless=headless,
+            slow_mo=slow_mo_ms,
+        )
+        mode_desc = "headless" if headless else "live headed desktop view"
+        await ScanProgressTracker.log(run_id, "INITIALIZING", f"Created isolated Playwright {browser_type} context ({mode_desc}) with ScopeGuard", 10)
         context = await ContextFactory.create_isolated_context(
             browser=browser,
             allowed_domains=set(allowed_domains),
@@ -327,6 +335,7 @@ async def _async_execute_scan(
                 await _enrich_findings_with_ai(func_result.findings)
             await ScanProgressTracker.log(run_id, "FUNCTIONAL", f"Functional pillar completed (Score: {func_result.score}/100, Findings: {len(func_result.findings)})", 48)
         else:
+            await ScanProgressTracker.log(run_id, "FUNCTIONAL", "Functional pillar skipped (disabled in scan profile)", 48)
             func_result = PillarScanResult(
                 pillar=PillarType.FUNCTIONAL,
                 score=100.0,
@@ -348,6 +357,7 @@ async def _async_execute_scan(
             )
             await ScanProgressTracker.log(run_id, "SECURITY", f"Security pillar completed (Score: {sec_result.score}/100, Findings: {len(sec_result.findings)})", 68)
         else:
+            await ScanProgressTracker.log(run_id, "SECURITY", "Security pillar skipped (disabled in scan profile)", 68)
             sec_result = PillarScanResult(
                 pillar=PillarType.SECURITY,
                 score=100.0,
@@ -364,6 +374,7 @@ async def _async_execute_scan(
             perf_result = await PerformanceScanner().scan(page, target_url, crawl_result=crawl_result)
             await ScanProgressTracker.log(run_id, "PERFORMANCE", f"Performance pillar completed (Score: {perf_result.score}/100, Findings: {len(perf_result.findings)})", 82)
         else:
+            await ScanProgressTracker.log(run_id, "PERFORMANCE", "Performance pillar skipped (disabled in scan profile)", 82)
             perf_result = PillarScanResult(
                 pillar=PillarType.PERFORMANCE,
                 score=100.0,
@@ -387,6 +398,7 @@ async def _async_execute_scan(
             )
             await ScanProgressTracker.log(run_id, "ACCESSIBILITY", f"Accessibility pillar completed (Score: {a11y_result.score}/100, Findings: {len(a11y_result.findings)})", 95)
         else:
+            await ScanProgressTracker.log(run_id, "ACCESSIBILITY", "Accessibility pillar skipped (disabled in scan profile)", 95)
             a11y_result = PillarScanResult(
                 pillar=PillarType.ACCESSIBILITY,
                 score=100.0,
@@ -437,6 +449,7 @@ async def _async_execute_scan(
 
         report_dict = unified_report.model_dump()
         report_dict["artifacts"] = {art["artifact_type"]: art["relative_path"] for art in artifacts}
+        report_dict["test_cases"] = func_result.metrics.get("executed_test_cases", [])
         await _persist_scan_success(run_id, report_dict, artifacts=artifacts)
         await ScanProgressTracker.log(
             run_id, "COMPLETED",
@@ -467,7 +480,6 @@ async def _async_execute_scan(
             except Exception:
                 pass
         if temp_video_dir and os.path.exists(temp_video_dir):
-            import shutil
             shutil.rmtree(temp_video_dir, ignore_errors=True)
 
 async def _execute_with_timeout(
