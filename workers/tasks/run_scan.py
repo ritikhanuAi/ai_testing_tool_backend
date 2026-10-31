@@ -47,7 +47,12 @@ async def _persist_scan_start(run_id: str) -> None:
     except Exception as e:
         logger.warning(f"Could not update start status for run {run_id}: {e}")
 
-async def _persist_scan_success(run_id: str, report_data: Dict[str, Any], artifacts: Optional[List[Dict[str, Any]]] = None) -> None:
+async def _persist_scan_success(
+    run_id: str,
+    report_data: Dict[str, Any],
+    artifacts: Optional[List[Dict[str, Any]]] = None,
+    note: Optional[str] = None,
+) -> None:
     """Save report summary, artifacts, and mark test run as completed."""
     try:
         from app.core.database import AsyncSessionLocal
@@ -63,6 +68,8 @@ async def _persist_scan_success(run_id: str, report_data: Dict[str, Any], artifa
             if run:
                 run.status = RunStatus.COMPLETED
                 run.completed_at = datetime.now(timezone.utc)
+                if note:
+                    run.error_message = note
                 if artifacts:
                     for art in artifacts:
                         abs_p = os.path.join(settings.STORAGE_DIR, art["relative_path"])
@@ -78,6 +85,49 @@ async def _persist_scan_success(run_id: str, report_data: Dict[str, Any], artifa
                 await db.commit()
     except Exception as e:
         logger.error(f"Failed to persist scan success for run {run_id}: {e}", exc_info=True)
+
+async def _persist_partial_report(run_id: str, partial: Dict[str, Any], timeout_seconds: int) -> Dict[str, Any]:
+    """Save a report from the pillars that finished before the time limit.
+
+    Pillars that did not finish are marked SKIPPED (so they don't count toward the
+    grade) and the report is forced to "not passed", because it is incomplete.
+    """
+    from app.common.progress import ScanProgressTracker
+
+    reason = f"Not run: the scan reached its {timeout_seconds}-second time limit first"
+    pillar_results: List[PillarScanResult] = []
+    unfinished: List[str] = []
+    for pillar in PillarType:
+        result = partial.get(pillar)
+        if result is None:
+            unfinished.append(pillar.value)
+            result = PillarScanResult(
+                pillar=pillar,
+                score=0.0,
+                status="SKIPPED",
+                metrics={"skipped": True, "timed_out": True, "reason": reason},
+            )
+        pillar_results.append(result)
+
+    target_url = partial.get("target_url", "")
+    report = ReportAggregator.aggregate(run_id=run_id, target_url=target_url, pillar_results=pillar_results)
+    report_dict = report.model_dump()
+    report_dict["passed"] = False
+    report_dict["incomplete"] = True
+    report_dict["incomplete_reason"] = reason
+    report_dict["unfinished_pillars"] = unfinished
+    report_dict["artifacts"] = {}
+    functional = partial.get(PillarType.FUNCTIONAL)
+    report_dict["test_cases"] = functional.metrics.get("executed_test_cases", []) if functional else []
+
+    note = (
+        f"Partial report: time limit of {timeout_seconds}s reached. "
+        f"Unfinished checks: {', '.join(unfinished)}. Increase the scan profile timeout for a full report."
+    )
+    await _persist_scan_success(run_id, report_dict, note=note)
+    await ScanProgressTracker.log(run_id, "COMPLETED", note, 100, level="WARNING")
+    logger.warning(f"Scan {run_id}: {note}")
+    return {"status": "PARTIAL", "run_id": run_id, "unfinished_pillars": unfinished}
 
 async def _is_cancelled(run_id: str) -> bool:
     """Check if cancellation was requested via Redis flag."""
@@ -199,8 +249,16 @@ async def _async_execute_scan(
     credentials: Optional[Dict[str, Any]] = None,
     options: Optional[Dict[str, Any]] = None,
     scan_profile: Optional[Dict[str, Any]] = None,
+    partial: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Async execution routine inside Playwright worker."""
+    """Async execution routine inside Playwright worker.
+
+    ``partial`` is filled with each pillar result as soon as it finishes, so the
+    caller can still save a report if the overall time limit is reached.
+    """
+    if partial is None:
+        partial = {}
+    partial["target_url"] = target_url
     from app.common.progress import ScanProgressTracker
     await _persist_scan_start(run_id)
     await ScanProgressTracker.log(run_id, "INITIALIZING", f"Starting automated test scan on {redact_url(target_url)}", 5)
@@ -343,6 +401,9 @@ async def _async_execute_scan(
                 metrics={"skipped": True, "reason": "disabled by scan profile"},
             )
 
+        partial["target_url"] = target_url
+        partial[PillarType.FUNCTIONAL] = func_result
+
         if await _is_cancelled(run_id):
             raise asyncio.CancelledError("Scan cancelled after functional pillar")
 
@@ -365,6 +426,8 @@ async def _async_execute_scan(
                 metrics={"skipped": True, "reason": "disabled by scan profile"},
             )
 
+        partial[PillarType.SECURITY] = sec_result
+
         if await _is_cancelled(run_id):
             raise asyncio.CancelledError("Scan cancelled after security pillar")
 
@@ -381,6 +444,8 @@ async def _async_execute_scan(
                 status="SKIPPED",
                 metrics={"skipped": True, "reason": "disabled by scan profile"},
             )
+
+        partial[PillarType.PERFORMANCE] = perf_result
 
         if await _is_cancelled(run_id):
             raise asyncio.CancelledError("Scan cancelled after performance pillar")
@@ -494,6 +559,7 @@ async def _execute_with_timeout(
     timeout_seconds: int,
 ) -> Dict[str, Any]:
     from app.common.progress import ScanProgressTracker
+    partial: Dict[str, Any] = {}
     try:
         return await asyncio.wait_for(
             _async_execute_scan(
@@ -505,11 +571,17 @@ async def _execute_with_timeout(
                 credentials=credentials,
                 options=options,
                 scan_profile=scan_profile,
+                partial=partial,
             ),
             timeout=timeout_seconds,
         )
     except asyncio.TimeoutError:
         err_msg = f"Scan exceeded its {timeout_seconds}-second timeout limit"
+        if any(pillar in partial for pillar in PillarType):
+            try:
+                return await _persist_partial_report(run_id, partial, timeout_seconds)
+            except Exception as e:
+                logger.error(f"Could not save partial report for {run_id}: {e}", exc_info=True)
         logger.error(f"Scan {run_id} failed: {err_msg}")
         try:
             await _persist_scan_failure(run_id, err_msg)

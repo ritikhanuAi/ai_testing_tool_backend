@@ -1,3 +1,4 @@
+import asyncio
 from typing import Dict, Optional
 from pydantic import BaseModel, Field
 from ai_engine.clients.factory import LLMClientFactory
@@ -44,17 +45,37 @@ class AccessibilityFixer:
         rule_id: str,
         help_text: str,
         selector: Optional[str] = None,
-        html_snippet: Optional[str] = None
+        html_snippet: Optional[str] = None,
+        timeout_seconds: Optional[float] = None,
     ) -> str:
         """
-        Generates actionable developer fix. If the remote AI model is offline,
-        seamlessly returns the exact WCAG compliant fix template.
+        Generates actionable developer fix. If the remote AI model is offline or
+        does not answer within ``timeout_seconds`` (including retries),
+        returns the deterministic WCAG fix template instead.
         """
-        # Try AI generation if reachable
         try:
-            client = LLMClientFactory.get_client()
-            if await client.is_available():
-                prompt = f"""<untrusted_page_context>
+            ai_fix = await asyncio.wait_for(
+                cls._ai_fix(rule_id, help_text, selector, html_snippet),
+                timeout=timeout_seconds,
+            )
+            if ai_fix:
+                return ai_fix
+        except Exception:
+            pass
+        return cls.deterministic_fix(rule_id, selector)
+
+    @classmethod
+    async def _ai_fix(
+        cls,
+        rule_id: str,
+        help_text: str,
+        selector: Optional[str],
+        html_snippet: Optional[str],
+    ) -> Optional[str]:
+        client = LLMClientFactory.get_client()
+        if not await client.is_available():
+            return None
+        prompt = f"""<untrusted_page_context>
 WCAG Rule: {rule_id}
 Violation: {help_text}
 Selector: {selector or 'N/A'}
@@ -63,18 +84,19 @@ HTML Snippet: {html_snippet or 'N/A'}
 
 Generate the exact corrected code snippet to fix this violation.
 """
-                valid, response, _ = await SchemaEnforcer.generate_and_validate_with_retry(
-                    llm_client=client,
-                    system_prompt=A11Y_FIX_SYSTEM_PROMPT,
-                    initial_prompt=prompt,
-                    model_type=AccessibilityFixResponse,
-                )
-                if valid and response:
-                    return f"{response.explanation} Suggested fix: `{response.code_fix}`"
-        except Exception:
-            pass
+        valid, response, _ = await SchemaEnforcer.generate_and_validate_with_retry(
+            llm_client=client,
+            system_prompt=A11Y_FIX_SYSTEM_PROMPT,
+            initial_prompt=prompt,
+            model_type=AccessibilityFixResponse,
+        )
+        if valid and response:
+            return f"{response.explanation} Suggested fix: `{response.code_fix}`"
+        return None
 
-        # Robust deterministic fallback
+    @classmethod
+    def deterministic_fix(cls, rule_id: str, selector: Optional[str] = None) -> str:
+        """Return the built-in fix template for a WCAG rule (no AI call)."""
         rule_key = rule_id.lower().strip()
         for key, template in DETERMINISTIC_FIXES.items():
             if key in rule_key:

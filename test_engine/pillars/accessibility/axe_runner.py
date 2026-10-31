@@ -1,3 +1,4 @@
+import asyncio
 from playwright.async_api import Page
 from typing import List, Tuple, Dict, Any
 from app.common.constants import FindingSeverity
@@ -8,6 +9,9 @@ class AxeCoreScanner:
     """Runs automated WCAG 2.1 AA accessibility checks via axe-core with AI code fixes."""
 
     AXE_CDN_URL = "https://cdnjs.cloudflare.com/ajax/libs/axe-core/4.9.1/axe.min.js"
+    MAX_AI_FIXES = 5
+    AI_FIX_TIMEOUT_SECONDS = 30.0
+    IMPACT_RANK = {"critical": 0, "serious": 1, "moderate": 2, "minor": 3}
 
     @classmethod
     async def run_axe(
@@ -50,7 +54,28 @@ class AxeCoreScanner:
             violations = results.get("violations", [])
             deduction = 0.0
 
-            for v in violations:
+            # Ask the AI only about the most severe violations, all at once, each with a
+            # time limit. Everything else gets the built-in fix template. Asking about every
+            # violation one by one could take minutes and push the scan past its time limit.
+            ai_fixes: Dict[int, str] = {}
+            if generate_fixes and violations:
+                ranked = sorted(
+                    range(len(violations)),
+                    key=lambda i: cls.IMPACT_RANK.get(violations[i].get("impact") or "minor", 3),
+                )[:cls.MAX_AI_FIXES]
+                answers = await asyncio.gather(*(
+                    AccessibilityFixer.get_fix(
+                        rule_id=violations[i]["id"],
+                        help_text=violations[i]["help"],
+                        selector=violations[i].get("selector"),
+                        html_snippet=violations[i].get("html"),
+                        timeout_seconds=cls.AI_FIX_TIMEOUT_SECONDS,
+                    )
+                    for i in ranked
+                ))
+                ai_fixes = dict(zip(ranked, answers))
+
+            for index, v in enumerate(violations):
                 impact = v.get("impact", "minor")
                 if impact == "critical":
                     sev = FindingSeverity.CRITICAL
@@ -65,14 +90,11 @@ class AxeCoreScanner:
                     sev = FindingSeverity.LOW
                     deduction += 2.0
 
-                # Generate actionable developer code fix (AI with deterministic fallback)
-                if generate_fixes:
-                    fix = await AccessibilityFixer.get_fix(
-                        rule_id=v["id"],
-                        help_text=v["help"],
-                        selector=v.get("selector"),
-                        html_snippet=v.get("html")
-                    )
+                # Actionable developer code fix (AI for the top violations, template otherwise)
+                if index in ai_fixes:
+                    fix = ai_fixes[index]
+                elif generate_fixes:
+                    fix = AccessibilityFixer.deterministic_fix(v["id"], v.get("selector"))
                 else:
                     fix = f"Review WCAG rule '{v['id']}' on this page and correct the affected element."
 
