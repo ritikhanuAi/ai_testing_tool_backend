@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import time
 import shutil
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
@@ -117,6 +118,8 @@ async def _persist_partial_report(run_id: str, partial: Dict[str, Any], timeout_
     report_dict["incomplete_reason"] = reason
     report_dict["unfinished_pillars"] = unfinished
     report_dict["artifacts"] = {}
+    report_dict["test_case_mode"] = partial.get("test_case_mode", "ai")
+    report_dict["ai_used"] = report_dict["test_case_mode"] != "human"
     functional = partial.get(PillarType.FUNCTIONAL)
     report_dict["test_cases"] = functional.metrics.get("executed_test_cases", []) if functional else []
 
@@ -191,6 +194,7 @@ async def _perform_authentication(page, credentials: Dict[str, Any]) -> None:
 
 async def _discover_and_generate_ai_tests(page, options: Dict[str, Any]) -> List[Any]:
     """Inspect page landmarks and generate structured test cases via LLM."""
+    started: Optional[float] = None
     try:
         from ai_engine.clients.factory import LLMClientFactory
         from ai_engine.prompts.test_generation import SYSTEM_PROMPT, build_case_generation_prompt
@@ -214,12 +218,17 @@ async def _discover_and_generate_ai_tests(page, options: Dict[str, Any]) -> List
 
         client = LLMClientFactory.get_client()
         prompt = build_case_generation_prompt(page_desc, form_fields)
+        started = time.perf_counter()
         raw_response = await client.generate(prompt=prompt, system_prompt=SYSTEM_PROMPT)
-        valid, case_model, _ = SchemaEnforcer.parse_test_case(raw_response)
+        ai_seconds = time.perf_counter() - started
+        valid, case_model, error = SchemaEnforcer.parse_test_case(raw_response)
         if valid and case_model:
+            logger.info(f"AI test case timing: goal-based test case '{case_model.id}' written in {ai_seconds:.1f}s")
             return [case_model]
+        logger.warning(f"AI test case timing: AI answered in {ai_seconds:.1f}s but the test case was invalid: {error}")
     except Exception as ai_err:
-        logger.warning(f"Autonomous AI test generation skipped: {ai_err}")
+        ai_seconds = time.perf_counter() - started if started else 0.0
+        logger.warning(f"Autonomous AI test generation skipped after {ai_seconds:.1f}s: {ai_err}")
     return []
 
 async def _enrich_findings_with_ai(findings: List[Any]) -> None:
@@ -349,13 +358,24 @@ async def _async_execute_scan(
         if await _is_cancelled(run_id):
             raise asyncio.CancelledError("Scan cancelled before start")
 
+        # Two exclusive modes: a human-written test pack means NO AI anywhere in the scan
+        # (no AI test writing, failure explanations, accessibility fixes, or screenshot review).
+        human_mode = bool(test_pack_yaml)
+        use_ai = not human_mode
+        partial["test_case_mode"] = "human" if human_mode else "ai"
+
         # 1. Functional Pillar (the authored test pack runs against its starting page).
         test_cases = []
-        if test_pack_yaml:
+        if human_mode:
             valid, pack, errors = SchemaValidator.validate_yaml_pack(test_pack_yaml)
             if not valid or not pack:
                 raise ValueError(f"Test pack failed worker-side validation: {errors}")
             test_cases = pack.cases
+            await ScanProgressTracker.log(
+                run_id, "FUNCTIONAL",
+                f"Human test pack mode: running {len(test_cases)} human-written test case(s); AI is turned off for this scan",
+                22,
+            )
         elif profile.get("use_ai_generation", True) and profile.get("ai_test_goals"):
             await ScanProgressTracker.log(run_id, "FUNCTIONAL", "Synthesizing AI test scenarios for target goals...", 22)
             ai_cases = await _discover_and_generate_ai_tests(page, profile)
@@ -385,10 +405,11 @@ async def _async_execute_scan(
                 test_cases=test_cases,
                 run_id=run_id,
                 allow_state_changing=bool(profile["allow_state_changing"]),
+                use_ai=use_ai,
                 crawl_result=crawl_result,
                 initial_status_code=response.status if response else None,
             )
-            if profile.get("ai_explain_failures", True) and func_result.findings:
+            if use_ai and profile.get("ai_explain_failures", True) and func_result.findings:
                 await ScanProgressTracker.log(run_id, "FUNCTIONAL", "Diagnosing functional failures with AI...", 40)
                 await _enrich_findings_with_ai(func_result.findings)
             await ScanProgressTracker.log(run_id, "FUNCTIONAL", f"Functional pillar completed (Score: {func_result.score}/100, Findings: {len(func_result.findings)})", 48)
@@ -459,6 +480,7 @@ async def _async_execute_scan(
                 target_url,
                 run_id=run_id,
                 comparison_paths=func_result.metrics.get("visual_comparison_paths", []),
+                use_ai=use_ai,
                 crawl_result=crawl_result,
             )
             await ScanProgressTracker.log(run_id, "ACCESSIBILITY", f"Accessibility pillar completed (Score: {a11y_result.score}/100, Findings: {len(a11y_result.findings)})", 95)
@@ -515,6 +537,8 @@ async def _async_execute_scan(
         report_dict = unified_report.model_dump()
         report_dict["artifacts"] = {art["artifact_type"]: art["relative_path"] for art in artifacts}
         report_dict["test_cases"] = func_result.metrics.get("executed_test_cases", [])
+        report_dict["test_case_mode"] = "human" if human_mode else "ai"
+        report_dict["ai_used"] = use_ai
         await _persist_scan_success(run_id, report_dict, artifacts=artifacts)
         await ScanProgressTracker.log(
             run_id, "COMPLETED",

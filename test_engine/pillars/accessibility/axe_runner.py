@@ -20,7 +20,9 @@ class AxeCoreScanner:
         *,
         page_url: str = "",
         generate_fixes: bool = True,
+        use_ai: bool = True,
     ) -> Tuple[List[PillarFinding], float, Dict[str, Any]]:
+        """Run axe-core. With ``use_ai=False`` fix suggestions come only from built-in templates."""
         findings: List[PillarFinding] = []
 
         try:
@@ -58,7 +60,7 @@ class AxeCoreScanner:
             # time limit. Everything else gets the built-in fix template. Asking about every
             # violation one by one could take minutes and push the scan past its time limit.
             ai_fixes: Dict[int, str] = {}
-            if generate_fixes and violations:
+            if generate_fixes and use_ai and violations:
                 ranked = sorted(
                     range(len(violations)),
                     key=lambda i: cls.IMPACT_RANK.get(violations[i].get("impact") or "minor", 3),

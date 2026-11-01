@@ -27,8 +27,11 @@ class AccessibilityScanner(BasePillarScanner):
         run_id: str = "manual_run",
         comparison_paths: Optional[List[str]] = None,
         crawl_result: Optional[CrawlResult] = None,
+        use_ai: bool = True,
         **kwargs
     ) -> PillarScanResult:
+        """Run accessibility checks. ``use_ai=False`` (human test pack mode) skips the AI
+        screenshot review and AI fix suggestions; only deterministic checks run."""
         start_time = time.time()
         findings: List[PillarFinding] = []
 
@@ -54,6 +57,7 @@ class AccessibilityScanner(BasePillarScanner):
                     page,
                     page_url=redact_url(audit_url),
                     generate_fixes=(index == 0),
+                    use_ai=use_ai,
                 )
                 findings.extend(axe_findings)
                 if axe_metrics.get("axe_audit_completed"):
@@ -89,31 +93,45 @@ class AccessibilityScanner(BasePillarScanner):
         read_score = sum(read_scores) / len(read_scores) if read_scores else 0.0
 
         # Vision review remains on the start page; deterministic checks cover each crawled route.
-        try:
-            if page.url != target_url:
-                await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
-        except Exception as error:
-            accessibility_page_errors.append(f"{redact_url(target_url)}: {type(error).__name__}")
-        vision_findings, vision_score = await UXVisionScanner.audit_visual_design(
-            page, run_id=run_id, comparison_paths=comparison_paths
-        )
-        findings.extend(vision_findings)
-        vision_review_completed = not any(
-            finding.id == "UX-VISION-REVIEW-UNAVAILABLE" for finding in vision_findings
-        )
+        # It is an AI feature, so it is turned off (not failed) when use_ai is False.
+        vision_review_disabled = not use_ai
+        vision_score = 0.0
+        vision_review_completed = False
+        if not vision_review_disabled:
+            try:
+                if page.url != target_url:
+                    await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+            except Exception as error:
+                accessibility_page_errors.append(f"{redact_url(target_url)}: {type(error).__name__}")
+            vision_findings, vision_score = await UXVisionScanner.audit_visual_design(
+                page, run_id=run_id, comparison_paths=comparison_paths
+            )
+            findings.extend(vision_findings)
+            vision_review_completed = not any(
+                finding.id == "UX-VISION-REVIEW-UNAVAILABLE" for finding in vision_findings
+            )
         total_findings = len(findings)
         finding_severity_counts = {
             member.value: sum(finding.severity == member for finding in findings)
             for member in FindingSeverity
         }
 
-        # Composite Pillar Score (Weighted: 50% WCAG, 20% Mobile, 15% Readability, 15% Vision UX)
-        composite_score = (
-            (axe_score * 0.50) +
-            (mobile_score * 0.20) +
-            (read_score * 0.15) +
-            (vision_score * 0.15)
-        )
+        # Composite Pillar Score (Weighted: 50% WCAG, 20% Mobile, 15% Readability, 15% Vision UX).
+        # When the AI review is turned off, the other three parts are renormalized (÷ 0.85)
+        # so the score is not penalized for a check that intentionally did not run.
+        if vision_review_disabled:
+            composite_score = (
+                (axe_score * 0.50) +
+                (mobile_score * 0.20) +
+                (read_score * 0.15)
+            ) / 0.85
+        else:
+            composite_score = (
+                (axe_score * 0.50) +
+                (mobile_score * 0.20) +
+                (read_score * 0.15) +
+                (vision_score * 0.15)
+            )
         score = round(max(0.0, min(100.0, composite_score)), 1)
         duration = round(time.time() - start_time, 2)
         status = "PASSED" if score >= 80 else ("WARNING" if score >= 60 else "FAILED")
@@ -137,7 +155,7 @@ class AccessibilityScanner(BasePillarScanner):
             or accessibility_page_errors
             or crawl_limited
             or crawl_pages_not_audited
-            or not vision_review_completed
+            or (not vision_review_completed and not vision_review_disabled)
         ):
             status = "WARNING"
 
@@ -156,8 +174,10 @@ class AccessibilityScanner(BasePillarScanner):
                 **axe_metrics,
                 "mobile_responsive_score": mobile_score,
                 "readability_score": read_score,
-                "vision_ux_score": vision_score,
+                "vision_ux_score": None if vision_review_disabled else vision_score,
                 "vision_review_completed": vision_review_completed,
+                "vision_review_disabled": vision_review_disabled,
+                "ai_used": use_ai,
                 "total_findings": total_findings,
                 "finding_count": total_findings,
                 "reported_findings": min(total_findings, 1000),
@@ -167,11 +187,13 @@ class AccessibilityScanner(BasePillarScanner):
                 "pages_audited": pages_audited,
                 "crawl_pages_not_audited": crawl_pages_not_audited,
                 "page_audit_errors": [redact_url(error) for error in accessibility_page_errors],
-                "vision_review_scope": "starting page only",
+                "vision_review_scope": "turned off (human test pack mode, no AI)" if vision_review_disabled else "starting page only",
                 "score_unavailable": pages_audited == 0,
                 "score_note": (
                     "No axe-core audit completed; 0 is not a measured zero-violation result."
-                    if pages_audited == 0 else (
+                    if pages_audited == 0 else
+                    "Human test pack mode: AI screenshot review was turned off; the score uses WCAG, mobile and readability checks only."
+                    if vision_review_disabled else (
                         "The configured remote VLM review was unavailable; its 15% score component is zero."
                         if not vision_review_completed else "Page scores average successful axe-core audits in this crawl."
                     )

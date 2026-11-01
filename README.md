@@ -31,6 +31,13 @@ Scans are queued by `app/apps/test_runs/services.py` and run in the Celery worke
 
 The report records visited/discovered page counts and whether page, depth, link, sitemap, unsafe-route, or time limits truncated coverage. A warning status means the grade covers only the inspected sample. This discovers links and sitemap URLs; routes hidden behind app interactions or login flows may not be discoverable. Functional route health, security, performance, and deterministic accessibility checks use the crawled pages; authored interaction cases and AI visual review remain scoped to the starting page. Security file/TLS probes are limited to ten origins. If a TLS handshake cannot be completed, the report marks TLS as unverified and warns.
 
+### Test Case Modes: Human or AI (never both)
+
+Each scan runs in exactly one mode:
+
+- **Human mode** — a human-written test pack (YAML/JSON) is supplied. Only those cases run, and **no AI is used anywhere in the scan**: no AI test writing or exploration, no auto-generated form checks, no AI failure explanations, no AI accessibility fix suggestions (built-in templates are used), and no AI screenshot review. The accessibility score is then computed from WCAG, mobile and readability checks only (renormalized), and the report records `test_case_mode: "human"` and `ai_used: false`.
+- **AI mode** — no test pack. The bounded AI journey (or a goal-based AI case when `ai_test_goals` is set), built-in form checks, and all AI explanations/reviews run as described below.
+
 ### What the Pillars Measure
 
 - **Functional:** HTTP status and navigation failures for each visited route, JavaScript/console errors, failed first-party requests, broken images, plus authored or AI-guided starting-page interactions. Authored journeys run from the starting page and any explicit test-pack navigation.

@@ -73,10 +73,18 @@ class FunctionalScanner(BasePillarScanner):
         inventory = await FunctionalSpider.extract_interactive_inventory(page)
         forms = inventory.get("forms", [])
         catalog = inventory.get("elements", [])
-        supplied_cases = bool(test_cases)
+        # Human test pack mode (use_ai=False): run only the human-written cases, even if
+        # the pack is empty; no auto-generated form checks and no AI journey.
+        use_ai = bool(kwargs.get("use_ai", True))
+        supplied_cases = bool(test_cases) or not use_ai
         cases = list(test_cases or [])
         if not supplied_cases:
+            suite_started = time.perf_counter()
             cases = await AITestCaseGenerator.generate_suite_for_forms(forms, target_url)
+            logger.info(
+                "[run %s] Form test cases (built-in rules, no AI): %d case(s) written in %.2fs",
+                run_id, len(cases), time.perf_counter() - suite_started,
+            )
             if forms:
                 await _emit_progress(run_id, "FUNCTIONAL", f"Extracted {len(forms)} form(s) from page and synthesized {len(cases)} test scenario(s)", 27)
 
@@ -188,6 +196,7 @@ class FunctionalScanner(BasePillarScanner):
         if not supplied_cases and catalog:
             try:
                 await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+                journey_started = time.perf_counter()
                 react_result = await self._run_react_journey(
                     page=page,
                     target_url=target_url,
@@ -195,6 +204,15 @@ class FunctionalScanner(BasePillarScanner):
                     last_status_code=last_status_code,
                     server_error_statuses=server_error_statuses,
                 )
+                journey_seconds = time.perf_counter() - journey_started
+                ai_seconds = react_result.get("ai_seconds", 0.0)
+                journey_msg = (
+                    f"AI test case timing: whole AI journey took {journey_seconds:.1f}s "
+                    f"({ai_seconds:.1f}s waiting for the AI, {react_result.get('ai_calls', 0)} AI call(s), "
+                    f"{react_result['actions']} action(s) done, completed={react_result['completed']})"
+                )
+                logger.info("[run %s] %s", run_id, journey_msg)
+                await _emit_progress(run_id, "FUNCTIONAL", journey_msg, 38)
                 react_actions = react_result["actions"]
                 react_completed = react_result["completed"]
                 react_counted = react_result["counted"]
@@ -388,6 +406,8 @@ class FunctionalScanner(BasePillarScanner):
         findings: List[PillarFinding] = []
         visual_paths: List[str] = []
         server_error_start = len(server_error_statuses)
+        # AI timing totals, reported by the caller (kept in a dict so every return path shares them).
+        ai_timing = {"ai_seconds": 0.0, "ai_calls": 0}
 
         def rejected_step(reason: str) -> Dict[str, Any]:
             findings.append(PillarFinding(
@@ -398,7 +418,7 @@ class FunctionalScanner(BasePillarScanner):
             ))
             return {
                 "actions": len(history), "completed": False, "counted": True,
-                "passed": False, "findings": findings, "visual_paths": visual_paths,
+                "passed": False, "findings": findings, "visual_paths": visual_paths, **ai_timing,
             }
 
         for iteration in range(MAX_REACT_ACTIONS + 1):
@@ -408,6 +428,7 @@ class FunctionalScanner(BasePillarScanner):
                 f"[run {run_id}] AI ReAct exploration (step {iteration + 1}/{MAX_REACT_ACTIONS}): "
                 f"analyzing {len(catalog)} interactive elements on {target_url} via LLM..."
             )
+            step_started = time.perf_counter()
             decision = await AITestCaseGenerator.choose_next_action(
                 target_url=target_url,
                 page_summary={
@@ -422,6 +443,18 @@ class FunctionalScanner(BasePillarScanner):
                 catalog=catalog,
                 history=history,
             )
+            step_seconds = time.perf_counter() - step_started
+            ai_timing["ai_seconds"] += step_seconds
+            ai_timing["ai_calls"] += 1
+            if decision is None:
+                outcome = "no valid answer"
+            elif decision.done:
+                outcome = f"finished with {len(decision.assertions)} assertion(s)"
+            else:
+                outcome = f"next action '{decision.step.action.value}'"
+            step_msg = f"AI test case timing: step {iteration + 1} took {step_seconds:.1f}s ({outcome})"
+            logger.info("[run %s] %s", run_id, step_msg)
+            await _emit_progress(run_id, "FUNCTIONAL", step_msg, 30)
             if decision is None:
                 counted = bool(history)
                 if counted:
@@ -431,7 +464,7 @@ class FunctionalScanner(BasePillarScanner):
                         description="The bounded interaction stopped before producing a validated assertion.",
                         severity=FindingSeverity.MEDIUM,
                     ))
-                return {"actions": len(history), "completed": False, "counted": counted, "passed": False, "findings": findings, "visual_paths": visual_paths}
+                return {"actions": len(history), "completed": False, "counted": counted, "passed": False, "findings": findings, "visual_paths": visual_paths, **ai_timing}
 
             if decision.done:
                 if not history:
@@ -441,7 +474,7 @@ class FunctionalScanner(BasePillarScanner):
                         description="The agent returned an assertion before performing any allowed page action.",
                         severity=FindingSeverity.MEDIUM,
                     ))
-                    return {"actions": 0, "completed": False, "counted": True, "passed": False, "findings": findings, "visual_paths": visual_paths}
+                    return {"actions": 0, "completed": False, "counted": True, "passed": False, "findings": findings, "visual_paths": visual_paths, **ai_timing}
                 catalog_by_selector = {item["selector"]: item for item in catalog}
                 form_selectors = {
                     form.get("selector") for form in summary.get("forms", []) if form.get("selector")
@@ -463,7 +496,7 @@ class FunctionalScanner(BasePillarScanner):
                             description="The assertion target was not present in the current interactive catalog.",
                             severity=FindingSeverity.MEDIUM,
                         ))
-                        return {"actions": len(history), "completed": False, "counted": True, "passed": False, "findings": findings, "visual_paths": visual_paths}
+                        return {"actions": len(history), "completed": False, "counted": True, "passed": False, "findings": findings, "visual_paths": visual_paths, **ai_timing}
                 passed = True
                 for assertion in decision.assertions:
                     result = await AssertionRunner.evaluate_assertion(
@@ -483,7 +516,7 @@ class FunctionalScanner(BasePillarScanner):
                             evidence_path=evidence,
                             selector_or_url=redact_text(str(assertion.target or assertion.value or "")),
                         ))
-                return {"actions": len(history), "completed": True, "counted": True, "passed": passed, "findings": findings, "visual_paths": visual_paths}
+                return {"actions": len(history), "completed": True, "counted": True, "passed": passed, "findings": findings, "visual_paths": visual_paths, **ai_timing}
 
             if len(history) >= MAX_REACT_ACTIONS:
                 findings.append(PillarFinding(
@@ -492,7 +525,7 @@ class FunctionalScanner(BasePillarScanner):
                     description=f"The journey did not finish or assert a result within {MAX_REACT_ACTIONS} actions.",
                     severity=FindingSeverity.MEDIUM,
                 ))
-                return {"actions": len(history), "completed": False, "counted": True, "passed": False, "findings": findings, "visual_paths": visual_paths}
+                return {"actions": len(history), "completed": False, "counted": True, "passed": False, "findings": findings, "visual_paths": visual_paths, **ai_timing}
 
             step = decision.step
             logger.info(f"[run {run_id}] AI chose action '{step.action.value}' on target '{step.target}'")
@@ -554,6 +587,6 @@ class FunctionalScanner(BasePillarScanner):
                     evidence_path=evidence,
                     selector_or_url=redact_text(step.target or ""),
                 ))
-                return {"actions": len(history), "completed": False, "counted": True, "passed": False, "findings": findings, "visual_paths": visual_paths}
+                return {"actions": len(history), "completed": False, "counted": True, "passed": False, "findings": findings, "visual_paths": visual_paths, **ai_timing}
 
-        return {"actions": len(history), "completed": False, "counted": bool(history), "passed": False, "findings": findings, "visual_paths": visual_paths}
+        return {"actions": len(history), "completed": False, "counted": bool(history), "passed": False, "findings": findings, "visual_paths": visual_paths, **ai_timing}
