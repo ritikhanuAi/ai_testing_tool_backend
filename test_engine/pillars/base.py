@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import Dict, Any, List, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 from app.common.constants import PillarType, FindingSeverity
 
 import hashlib
@@ -15,6 +15,7 @@ class PillarFinding(BaseModel):
     selector_or_url: Optional[str] = None
     suggested_fix: Optional[str] = None
 
+    @computed_field  # included in model_dump() so saved reports and the API carry it
     @property
     def fingerprint(self) -> str:
         """Deterministic SHA-1 fingerprint for tracking findings across test runs."""

@@ -72,7 +72,7 @@ Each test case inside the `"cases"` array must follow this schema:
 |---|:---:|:---:|:---:|---|---|
 | `id` | `string` | **Yes** | — | Unique identifier for this test case | `"TC-AUTH-001"` |
 | `title` | `string` | **Yes** | — | Short human-readable title | `"User Login with Valid Password"` |
-| `pillar` | `string` | No | `"functional"` | Pillar classification (`functional`, `security`, `performance`, `accessibility`) | `"functional"` |
+| `pillar` | `string` | No | `"functional"` | Pillar classification (`functional`, `security`, `performance`, `accessibility`). Also accepted: `functionality` → functional, `user_friendly_ui` / `ui` / `ux` / `usability` → accessibility | `"functional"` |
 | `risk` | `string` | No | `"read_only"` | Safety level: `"read_only"` or `"state_changing"` | `"read_only"` |
 | `tags` | `array[string]` | No | `[]` | Categorical tags for suite filtering and reporting | `["auth", "smoke", "p0"]` |
 | `preconditions`| `array[string]` | No | `[]` | Prerequisites required before executing steps | `["clean_session"]` |
@@ -174,7 +174,8 @@ Every step in the `steps` array represents a real Playwright browser operation. 
 | `select_option` | **Required** (Selector) | **Required** (Value) | Selects a native `<select>` dropdown option | `{"action": "select_option", "target": "#country", "value": "US"}` |
 | `scroll` | **Required** (Selector) | Optional | Scrolls the element into the active viewport | `{"action": "scroll", "target": "#footer-submit"}` |
 | `hover` | **Required** (Selector) | Optional | Hovers the mouse cursor over element | `{"action": "hover", "target": ".nav-dropdown"}` |
-| `wait` | Optional | Optional | Explicit pause for animations/SPA lag (`timeout_ms`) | `{"action": "wait", "timeout_ms": 1000}` |
+| `wait` | Optional | Optional | Explicit pause in ms, given as `timeout_ms` or `value` (default 1000) | `{"action": "wait", "timeout_ms": 1000}` |
+| `reload_page` | None | None | Reloads the current page | `{"action": "reload_page"}` |
 | `download` | **Required** (Selector) | Optional | Clicks element and awaits file download | `{"action": "download", "target": "#download-pdf"}` |
 
 ### Action Decision Guide: What Action to Choose and When
@@ -215,6 +216,13 @@ Assertions verify that the page responded correctly. If any assertion fails, the
 | `page_title_contains` | None | **Required** (String) | Asserts `<title>` contains substring | `{"type": "page_title_contains", "value": "Home"}` |
 | `status_code_equals` | None | **Required** (Integer) | Asserts primary page HTTP response code | `{"type": "status_code_equals", "value": 200}` |
 | `option_list_not_empty`| **Required** (Selector) | None | Asserts `<select>` contains at least 1 option | `{"type": "option_list_not_empty", "target": "#city"}` |
+| `text_not_contains` | **Required** (Selector) | **Required** (String) | Asserts element text does NOT contain the value (fails if the element is missing) | `{"type": "text_not_contains", "target": ".error", "value": "MyPassword"}` |
+| `attribute_equals` | **Required** (Selector) | **Required** (String) + **`attribute`** | Asserts an HTML attribute has the value | `{"type": "attribute_equals", "target": "#password", "attribute": "type", "value": "password"}` |
+| `page_load_time_less_than` | None | **Required** (ms) | Current page's full load time (Navigation Timing) is below the limit | `{"type": "page_load_time_less_than", "value": 5000}` |
+| `response_time_less_than` | None | **Required** (ms) | Time from the start of the last non-wait step (e.g. clicking Sign in) until the network goes quiet is below the limit | `{"type": "response_time_less_than", "value": 3000}` |
+| `render_time_less_than` | None | **Required** (ms) | Largest Contentful Paint (First Contentful Paint if LCP is unsupported) is below the limit | `{"type": "render_time_less_than", "value": 5000}` |
+
+> Timing checks are browser lab measurements from one run, not real-user averages.
 
 ### Assertion Decision Guide: What Assertion to Choose and When
 
@@ -228,6 +236,9 @@ Assertions verify that the page responded correctly. If any assertion fails, the
 | **Verifying correct page loaded** | `page_title_contains` | Great for quick SEO / sanity checks on landing pages without coupling to DOM selectors. |
 | **Verifying server health / response** | `status_code_equals` | Verifies HTTP status code (e.g. `200` for OK, `404` for not found checks). |
 | **Verifying cascading dropdowns populated** | `option_list_not_empty` | When choosing a State/Province dynamically populates City options from an API. |
+| **Verifying a password is masked / shown** | `attribute_equals` | Check `type` is `password` (masked) or `text` (after clicking the eye icon). Also good for `placeholder`. |
+| **Verifying sensitive data is NOT shown** | `text_not_contains` | E.g. the typed password must not appear in the login error message. |
+| **Verifying speed** | `page_load_time_less_than`, `response_time_less_than`, `render_time_less_than` | Page load after `open_page`; response after a click; render for heavy pages like maps. |
 
 ## 5. Ready-to-Use Real-World Examples
 

@@ -36,6 +36,7 @@ The report records visited/discovered page counts and whether page, depth, link,
 Each scan runs in exactly one mode:
 
 - **Human mode** — a human-written test pack (YAML/JSON) is supplied. Only those cases run, and **no AI is used anywhere in the scan**: no AI test writing or exploration, no auto-generated form checks, no AI failure explanations, no AI accessibility fix suggestions (built-in templates are used), and no AI screenshot review. The accessibility score is then computed from WCAG, mobile and readability checks only (renormalized), and the report records `test_case_mode: "human"` and `ai_used: false`.
+  Human test cases can also check attributes (`attribute_equals`), absent text (`text_not_contains`), and lab timings: `page_load_time_less_than` (Navigation Timing load), `response_time_less_than` (from the last non-wait step until the network is idle, minus Playwright's 500 ms idle window), and `render_time_less_than` (Largest Contentful Paint, or First Contentful Paint when LCP is unavailable). Pillar names `functionality` and `user_friendly_ui` are accepted as `functional` and `accessibility`. See `TEST_CASE_JSON_GUIDE.md`.
 - **AI mode** — no test pack. The bounded AI journey (or a goal-based AI case when `ai_test_goals` is set), built-in form checks, and all AI explanations/reviews run as described below.
 
 ### What the Pillars Measure

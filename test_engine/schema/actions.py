@@ -11,6 +11,7 @@ class ActionType(str, Enum):
     DOWNLOAD = "download"
     SCROLL = "scroll"
     HOVER = "hover"
+    RELOAD_PAGE = "reload_page"
 
 class ActionStep(BaseModel):
     action: ActionType

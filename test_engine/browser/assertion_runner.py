@@ -3,11 +3,44 @@ from test_engine.schema.assertions import Assertion, AssertionType
 from test_engine.browser.locators import resolve_locator
 from typing import Dict, Any, List, Optional
 
+# How long new element-based assertions wait for a missing element before failing.
+ELEMENT_WAIT_MS = 5000
+
+PAGE_LOAD_TIME_JS = """() => {
+    const nav = performance.getEntriesByType('navigation')[0];
+    if (!nav) return null;
+    return nav.loadEventEnd > 0 ? nav.loadEventEnd - nav.startTime : performance.now() - nav.startTime;
+}"""
+
+# Largest Contentful Paint (when the biggest visible element finished rendering); falls back to
+# First Contentful Paint on browsers without LCP support.
+RENDER_TIME_JS = """() => new Promise((resolve) => {
+    let lcp = null;
+    try {
+        new PerformanceObserver((list) => {
+            const entries = list.getEntries();
+            if (entries.length) lcp = entries[entries.length - 1].startTime;
+        }).observe({ type: 'largest-contentful-paint', buffered: true });
+    } catch (error) {}
+    setTimeout(() => {
+        if (lcp !== null) return resolve({ ms: lcp, metric: 'largest contentful paint' });
+        const fcp = performance.getEntriesByName('first-contentful-paint')[0];
+        resolve({ ms: fcp ? fcp.startTime : null, metric: 'first contentful paint' });
+    }, 150);
+})"""
+
 class AssertionRunner:
     """Evaluates deterministic assertions against current browser page state."""
 
     @staticmethod
+    async def _attached(locator):
+        """Wait briefly for the element instead of Playwright's 30 s default."""
+        await locator.wait_for(state="attached", timeout=ELEMENT_WAIT_MS)
+        return locator
+
+    @staticmethod
     async def _read_text(locator) -> str:
+        await AssertionRunner._attached(locator)
         tag = await locator.evaluate("element => element.tagName.toLowerCase()")
         if tag in ("input", "textarea", "select"):
             return await locator.input_value()
@@ -19,8 +52,13 @@ class AssertionRunner:
         assertion: Assertion,
         last_status_code: Optional[int] = None,
         server_error_statuses: Optional[List[int]] = None,
+        response_time_ms: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Check whether page state satisfies assertion condition."""
+        """Check whether page state satisfies assertion condition.
+
+        ``response_time_ms`` is measured by the caller (time from the last action until the
+        page's network went quiet) and is only used by ``response_time_less_than``.
+        """
         try:
             a_type = assertion.type
 
@@ -127,7 +165,7 @@ class AssertionRunner:
                 }
 
             elif a_type == AssertionType.INPUT_INVALID:
-                is_invalid = await resolve_locator(page, assertion.target).evaluate(
+                is_invalid = await (await AssertionRunner._attached(resolve_locator(page, assertion.target))).evaluate(
                     "element => element.checkValidity() === false"
                 )
                 return {
@@ -139,7 +177,7 @@ class AssertionRunner:
                 }
 
             elif a_type == AssertionType.FORM_INVALID:
-                is_invalid = await resolve_locator(page, assertion.target).evaluate(
+                is_invalid = await (await AssertionRunner._attached(resolve_locator(page, assertion.target))).evaluate(
                     "form => form.checkValidity() === false"
                 )
                 return {
@@ -172,6 +210,65 @@ class AssertionRunner:
                     "passed": status_ok and not has_server_error,
                     "expected": "no server error response or error page",
                     "actual": f"navigation HTTP {actual_status}; failed responses={failed_responses}; error text={has_server_error}",
+                }
+
+            elif a_type == AssertionType.ATTRIBUTE_EQUALS:
+                actual_value = await resolve_locator(page, assertion.target).get_attribute(
+                    assertion.attribute, timeout=ELEMENT_WAIT_MS
+                )
+                expected_value = str(assertion.value)
+                return {
+                    "type": a_type.value,
+                    "target": assertion.target,
+                    "passed": actual_value == expected_value,
+                    "expected": f"{assertion.attribute}='{expected_value}'",
+                    "actual": f"{assertion.attribute}='{actual_value}'" if actual_value is not None else f"no '{assertion.attribute}' attribute",
+                }
+
+            elif a_type == AssertionType.TEXT_NOT_CONTAINS:
+                locator = resolve_locator(page, assertion.target)
+                actual_text = await AssertionRunner._read_text(locator)
+                return {
+                    "type": a_type.value,
+                    "target": assertion.target,
+                    "passed": str(assertion.value) not in actual_text,
+                    "expected": f"does not contain '{assertion.value}'",
+                    "actual": actual_text.strip()[:300],
+                }
+
+            elif a_type == AssertionType.PAGE_LOAD_TIME_LESS_THAN:
+                limit_ms = float(assertion.value)
+                try:
+                    # Let the page finish loading, but never wait much longer than the limit.
+                    await page.wait_for_load_state("load", timeout=limit_ms + 1000)
+                except Exception:
+                    pass
+                load_ms = await page.evaluate(PAGE_LOAD_TIME_JS)
+                return {
+                    "type": a_type.value,
+                    "passed": load_ms is not None and load_ms < limit_ms,
+                    "expected": f"page load < {limit_ms:.0f} ms",
+                    "actual": f"{load_ms:.0f} ms" if load_ms is not None else "not measured (no navigation timing)",
+                }
+
+            elif a_type == AssertionType.RENDER_TIME_LESS_THAN:
+                limit_ms = float(assertion.value)
+                measured = await page.evaluate(RENDER_TIME_JS)
+                render_ms = measured.get("ms") if measured else None
+                return {
+                    "type": a_type.value,
+                    "passed": render_ms is not None and render_ms < limit_ms,
+                    "expected": f"render < {limit_ms:.0f} ms",
+                    "actual": f"{render_ms:.0f} ms ({measured.get('metric')})" if render_ms is not None else "not measured",
+                }
+
+            elif a_type == AssertionType.RESPONSE_TIME_LESS_THAN:
+                limit_ms = float(assertion.value)
+                return {
+                    "type": a_type.value,
+                    "passed": response_time_ms is not None and response_time_ms < limit_ms,
+                    "expected": f"response < {limit_ms:.0f} ms",
+                    "actual": f"{response_time_ms:.0f} ms" if response_time_ms is not None else "not measured (no action ran before this check)",
                 }
 
             else:

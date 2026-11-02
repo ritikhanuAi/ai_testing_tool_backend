@@ -16,6 +16,10 @@ from test_engine.pillars.functional.spider import FunctionalSpider
 from test_engine.policy.risk_checker import RiskPolicyChecker
 from test_engine.schema.actions import ActionType
 from test_engine.schema.assertions import AssertionType
+
+# Playwright's "networkidle" fires after 500 ms with no network traffic; that quiet window is
+# subtracted so response_time_less_than measures the actual response.
+NETWORK_IDLE_QUIET_MS = 500
 from test_engine.schema.case import TestCaseModel
 from test_engine.crawl.site_crawler import CrawlResult, redact_text, redact_url
 from test_engine.scoring.rubrics import calculate_pillar_deductions
@@ -109,6 +113,7 @@ class FunctionalScanner(BasePillarScanner):
             await _emit_progress(run_id, "FUNCTIONAL", f"Executing Test Scenario ({case_idx + 1}/{len(cases)}): {case.title}", 28 + min(12, case_idx * 3))
 
             step_records: List[Dict[str, Any]] = []
+            last_action_started: Optional[float] = None  # for response_time_less_than
             for step_idx, step in enumerate(case.steps):
                 tgt_info = f" on '{step.target}'" if step.target else ""
                 val_info = f" with '{step.value}'" if step.value else ""
@@ -118,6 +123,8 @@ class FunctionalScanner(BasePillarScanner):
                         page, run_id, f"{case.id}-BEFORE", full_page=False
                     )
                     visual_comparison_paths.append(before_path)
+                if step.action != ActionType.WAIT:
+                    last_action_started = time.perf_counter()
                 step_result = await ActionRunner.execute_step(page, step)
                 step_records.append({
                     "action": step.action.value,
@@ -152,6 +159,21 @@ class FunctionalScanner(BasePillarScanner):
                     await _emit_progress(run_id, "FUNCTIONAL", f"  ✗ Action '{step.action.value}' failed: {step_result.get('error')}", 30, level="WARNING")
                     break
 
+            response_time_ms: Optional[float] = None
+            response_limits = [
+                float(a.value) for a in case.assertions if a.type == AssertionType.RESPONSE_TIME_LESS_THAN
+            ]
+            if case_passed and response_limits and last_action_started is not None:
+                # Response time = from the start of the last action until the network goes quiet.
+                wait_ms = min(30000, max(5000, max(response_limits) * 2))
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=wait_ms)
+                    quiet_ms = NETWORK_IDLE_QUIET_MS
+                except Exception:
+                    quiet_ms = 0  # still busy after wait_ms, so the response is at least that slow
+                elapsed_ms = (time.perf_counter() - last_action_started) * 1000
+                response_time_ms = max(0.0, elapsed_ms - quiet_ms)
+
             if case_passed:
                 for assertion in case.assertions:
                     result = await AssertionRunner.evaluate_assertion(
@@ -159,6 +181,7 @@ class FunctionalScanner(BasePillarScanner):
                         assertion,
                         last_status_code=last_status_code[0],
                         server_error_statuses=server_error_statuses[case_server_error_start:],
+                        response_time_ms=response_time_ms,
                     )
                     assert_status = "PASSED" if result.get("passed", False) else "FAILED"
                     await _emit_progress(run_id, "FUNCTIONAL", f"  ↳ [Assert] {assertion.type.value} -> {assert_status}", 34)

@@ -73,7 +73,13 @@ class ActionRunner:
                 }
 
             elif step.action == ActionType.WAIT:
-                wait_ms = int(step.value) if step.value and str(step.value).isdigit() else 1000
+                # The wait length can be given as `value` or as `timeout_ms` (both in ms).
+                if step.value and str(step.value).isdigit():
+                    wait_ms = int(step.value)
+                elif "timeout_ms" in step.model_fields_set and step.timeout_ms:
+                    wait_ms = int(step.timeout_ms)
+                else:
+                    wait_ms = 1000
                 await page.wait_for_timeout(wait_ms)
                 return {
                     "action": step.action.value,
@@ -89,6 +95,16 @@ class ActionRunner:
                     "target": step.target,
                     "status": "PASSED",
                     "details": f"Hovered over '{step.target}'"
+                }
+
+            elif step.action == ActionType.RELOAD_PAGE:
+                response = await page.reload(timeout=timeout, wait_until="domcontentloaded")
+                status_code = response.status if response else None
+                return {
+                    "action": step.action.value,
+                    "target": step.target,
+                    "status": "PASSED",
+                    "details": f"Page reloaded (HTTP {status_code})" if status_code else "Page reloaded",
                 }
 
             elif step.action == ActionType.SCROLL:

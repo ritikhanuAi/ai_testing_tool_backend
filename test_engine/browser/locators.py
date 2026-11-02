@@ -4,9 +4,26 @@ import re
 
 _ROLE_TARGET = re.compile(r"^role=(?P<role>[a-zA-Z][\w-]*)(?:\[name=(?P<name>.+)\])?$")
 
+# ALL_CAPS_WITH_UNDERSCORES (e.g. VERIFY_REQUIRED_EMAIL_INPUT) is a fill-in-later placeholder,
+# never a real selector: HTML has no such element names. Failing at once avoids a long wait.
+_PLACEHOLDER_TARGET = re.compile(r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$")
+
+
+class PlaceholderTargetError(ValueError):
+    """Raised when a test step or assertion still uses a placeholder instead of a selector."""
+
+
+def is_placeholder_target(target: str) -> bool:
+    return bool(target) and bool(_PLACEHOLDER_TARGET.fullmatch(target.strip()))
+
 
 def resolve_locator(page, target: str):
     """Resolve the compact role syntax used in test packs, or a normal Playwright selector."""
+    if is_placeholder_target(target):
+        raise PlaceholderTargetError(
+            f"'{target.strip()}' is a placeholder, not a real selector. Replace it with a CSS "
+            "selector (e.g. #email, input[type='password']) or a role (e.g. role=button[name='Sign in'])."
+        )
     match = _ROLE_TARGET.fullmatch(target.strip())
     if not match:
         return page.locator(target)
