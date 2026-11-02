@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List, Optional
 from app.core.database import get_db
 from app.common.serializers import ResponseEnvelope
-from app.apps.test_runs.serializers import TriggerScanRequest, TestRunResponse, QuickScanRequest, CustomScanRequest
+from app.apps.test_runs.serializers import TriggerScanRequest, TestRunResponse, QuickScanRequest, CustomScanRequest, DiscoverModulesRequest, DiscoverModulesResponse
 from app.apps.test_runs.services import dispatch_scan_run, dispatch_quick_scan, dispatch_custom_scan
 from app.apps.test_runs.selectors import list_test_runs, get_test_run_by_id, list_run_artifacts
 
@@ -122,6 +122,22 @@ async def get_run_trace_view(run_id: str):
         media_type="application/zip",
         filename=f"{run_id}_trace.zip"
     )
+
+async def discover_modules_view(
+    data: DiscoverModulesRequest,
+) -> ResponseEnvelope[DiscoverModulesResponse]:
+    """Login to target site, extract navigation modules from HTML DOM, generate AI test goals."""
+    import asyncio
+    from app.apps.test_runs.module_discovery import discover_site_modules
+    try:
+        result = await asyncio.wait_for(discover_site_modules(data), timeout=120)
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Module discovery timed out (120s limit). Check the URL is reachable and credentials are correct."
+        )
+    return ResponseEnvelope(message="Module discovery completed", data=result)
+
 
 async def get_run_artifacts_view(
     run_id: str,

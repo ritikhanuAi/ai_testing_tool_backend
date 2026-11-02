@@ -1,4 +1,5 @@
-from celery import Celery
+from celery import Celery, signals
+from celery.app.trace import build_tracer, setup_worker_optimizations
 from app.core.config import settings
 
 # Register all database models so mapper relationships resolve in Celery worker processes
@@ -17,6 +18,19 @@ celery_app = Celery(
         "workers.tasks.generate_ai_cases"
     ]
 )
+
+@signals.worker_process_init.connect
+def init_worker_process(**kwargs):
+    import workers.tasks.run_scan  # noqa
+    import workers.tasks.generate_ai_cases  # noqa
+    celery_app.loader.import_default_modules()
+    setup_worker_optimizations(celery_app)
+    from socket import gethostname
+    hostname = gethostname()
+    for name, task in celery_app.tasks.items():
+        if task.__trace__ is None:
+            task.__trace__ = build_tracer(name, task, celery_app.loader, hostname, app=celery_app)
+
 
 celery_app.conf.update(
     task_serializer="json",

@@ -474,6 +474,8 @@ async def _async_execute_scan(
         # 4. Accessibility & UX Pillar (Axe-core WCAG + AI Code Fixes + Mobile + Multimodal Vision)
         if profile["check_accessibility"]:
             await ScanProgressTracker.log(run_id, "ACCESSIBILITY", "Starting Accessibility Pillar: Running Axe-core WCAG rules, responsive audits & AI visual review...", 85)
+            if page.is_closed():
+                page = await context.new_page()
             await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
             a11y_result = await AccessibilityScanner().scan(
                 page,

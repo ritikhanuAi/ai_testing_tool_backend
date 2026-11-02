@@ -26,7 +26,7 @@ pyyaml>=6.0.2
 openpyxl>=3.1.2
 
 # Background Tasks & Job Queue
-celery[redis]>=5.4.0
+celery[redis]>=5.4.0,<5.6.0
 redis>=5.2.0
 
 # HTTP & AI Clients

@@ -7,8 +7,9 @@ from app.apps.websites.views import analyze_website_view
 from app.apps.test_runs.views import (
     list_runs_view, trigger_scan_view, get_run_view, cancel_run_view, quick_scan_view,
     get_run_logs_view, execute_custom_scan_view, get_run_video_view, get_run_trace_view,
-    get_run_artifacts_view
+    get_run_artifacts_view, discover_modules_view
 )
+from app.apps.test_runs.serializers import DiscoverModulesResponse
 
 router = APIRouter(prefix="/test-runs", tags=["Test Runs"])
 
@@ -17,6 +18,7 @@ router.post("", response_model=ResponseEnvelope[TestRunResponse], status_code=st
 router.post("/quick-scan", response_model=ResponseEnvelope[TestRunResponse], status_code=status.HTTP_202_ACCEPTED, summary="Trigger Autonomous AI Quick Scan")(quick_scan_view)
 router.post("/execute-custom", response_model=ResponseEnvelope[TestRunResponse], status_code=status.HTTP_202_ACCEPTED, summary="Execute Custom Structured JSON Test Suite")(execute_custom_scan_view)
 router.post("/analyze-url", response_model=ResponseEnvelope[WebsiteAnalyzeResponse], summary="Analyze Website URL for Testing Requirements")(analyze_website_view)
+router.post("/discover-modules", response_model=ResponseEnvelope[DiscoverModulesResponse], summary="Discover Navigation Modules via DOM + AI Goal Generation")(discover_modules_view)
 router.get("/{run_id}", response_model=ResponseEnvelope[TestRunResponse], summary="Get Test Run By ID")(get_run_view)
 router.get("/{run_id}/logs", summary="Get Live Test Run Console Logs & Stage Progress")(get_run_logs_view)
 router.get("/{run_id}/video", summary="Stream or Download Test Run Video Recording")(get_run_video_view)

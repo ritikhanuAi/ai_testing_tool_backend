@@ -86,6 +86,22 @@ class TriggerScanRequest(BaseModel):
     test_pack_id: Optional[str] = None
     advanced_options: Optional[AdvancedExecutionOptions] = None
 
+class DiscoverModulesRequest(BaseModel):
+    url: str = Field(..., description="Target website entry URL")
+    credentials: Optional[AuthenticationPayload] = None
+
+class DiscoveredModule(BaseModel):
+    name: str
+    url: str
+    suggested_goal: str
+    depth: int = 0
+
+class DiscoverModulesResponse(BaseModel):
+    modules: List[DiscoveredModule]
+    base_url: str
+    discovery_time_ms: float
+    total_discovered: int
+
 class TestRunResponse(BaseSchema):
     id: str
     website_id: str
