@@ -80,7 +80,7 @@ class AxeCoreScanner:
             for index, v in enumerate(violations):
                 impact = v.get("impact", "minor")
                 if impact == "critical":
-                    sev = FindingSeverity.CRITICAL
+                    sev = FindingSeverity.HIGH   # axe "critical" = WCAG element issue, not app-breaking
                     deduction += 15.0
                 elif impact == "serious":
                     sev = FindingSeverity.HIGH

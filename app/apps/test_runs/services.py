@@ -146,12 +146,18 @@ async def dispatch_quick_scan(db: AsyncSession, request_data: QuickScanRequest) 
         "viewport_height": scan_profile.viewport_height,
         "headless": options_dict.get("headless", True),
         "slow_mo_ms": options_dict.get("slow_mo_ms", 0),
+        "use_ai_generation": bool(options_dict.get("use_ai_generation", True)),
+        "ai_test_goals": options_dict.get("ai_test_goals") or "",
+        "max_ai_cases": int(options_dict.get("max_ai_cases") or 5),
+        "max_crawl_depth": int(options_dict.get("max_crawl_depth", 2)),
+        "include_sitemap_urls": bool(options_dict.get("include_sitemap_urls", False)),
     }
 
     # 5. Create TestRun record
     test_run = TestRun(
         website_id=website.id,
         scan_profile_id=scan_profile.id,
+        run_name=request_data.name or None,
         status=RunStatus.QUEUED,
         started_at=datetime.now(timezone.utc)
     )

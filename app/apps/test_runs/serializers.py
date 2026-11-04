@@ -37,6 +37,7 @@ class AdvancedExecutionOptions(BaseModel):
     rate_limit_rps: int = 10            # Max HTTP requests per second to target
     timeout_seconds: int = 300          # Total scan timeout
     max_crawl_depth: int = 2            # Exploration depth
+    include_sitemap_urls: bool = False  # Module scans follow links from the selected page only
 
     # AI Intelligence Options
     use_ai_generation: bool = True      # Use LLM to author tests dynamically
@@ -107,10 +108,15 @@ class TestRunResponse(BaseSchema):
     website_id: str
     scan_profile_id: Optional[str] = None
     test_pack_id: Optional[str] = None
+    run_name: Optional[str] = None
     status: RunStatus
     celery_task_id: Optional[str] = None
     overall_score: Optional[float] = None
     grade: Optional[str] = None
+    functional_score: Optional[float] = None
+    security_score: Optional[float] = None
+    performance_score: Optional[float] = None
+    accessibility_score: Optional[float] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     error_message: Optional[str] = None

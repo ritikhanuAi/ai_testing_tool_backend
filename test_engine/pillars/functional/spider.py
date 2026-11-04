@@ -108,10 +108,14 @@ class FunctionalSpider:
                     const riskyName = /\b(submit|save|delete|remove|pay|purchase|checkout|send|create|update|register|sign ?up|log ?out|confirm|buy|order|post|publish|upload|book|reserve|transfer|unsubscribe)\b/.test(lowerName);
                     const allowedActions = [];
                     if (['textbox', 'searchbox'].includes(role) && !credentialControl) allowedActions.push('type_text');
-                    if (role === 'combobox' && name && !form) allowedActions.push(tag === 'select' ? 'select_option' : 'click');
-                    if (['checkbox', 'radio'].includes(role) && name && !form && !riskyName) allowedActions.push('click');
+                    // Allow select_option for <select> even inside forms — selecting an option doesn't submit the form.
+                    if (role === 'combobox' && name && tag === 'select') allowedActions.push('select_option');
+                    // Allow click for non-select combobox (custom dropdowns) regardless of form context.
+                    if (role === 'combobox' && name && tag !== 'select') allowedActions.push('click');
+                    if (['checkbox', 'radio'].includes(role) && name && !riskyName) allowedActions.push('click');
                     if (['tab', 'menuitem'].includes(role) && name && !riskyName) allowedActions.push('click');
-                    if (role === 'button' && name && !isSubmit && !form && !riskyName) allowedActions.push('click');
+                    // Allow non-submit, non-risky buttons even inside forms (filter/clear/search buttons).
+                    if (role === 'button' && name && !isSubmit && !riskyName) allowedActions.push('click');
                     if (['button', 'link', 'tab', 'menuitem'].includes(role)) allowedActions.push('hover');
                     return {
                         selector,
@@ -123,6 +127,7 @@ class FunctionalSpider:
                         name,
                         placeholder: el.getAttribute('placeholder') || '',
                         required: !!el.required || el.getAttribute('aria-required') === 'true',
+                        selected_value: tag === 'select' ? el.value : null,
                         form_id: form ? formId(form) : null,
                         is_submit: isSubmit,
                         allowed_actions: allowedActions,

@@ -10,10 +10,17 @@ class TestRun(BaseModel):
     scan_profile_id = Column(String(36), ForeignKey("scan_profiles.id", ondelete="SET NULL"), nullable=True)
     test_pack_id = Column(String(36), ForeignKey("test_packs.id", ondelete="SET NULL"), nullable=True)
 
+    run_name = Column(String(255), nullable=True, index=True)
+
     status = Column(SQLEnum(RunStatus), default=RunStatus.PENDING, nullable=False, index=True)
     celery_task_id = Column(String(255), nullable=True)
     overall_score = Column(Float, nullable=True)
     grade = Column(String(5), nullable=True)
+
+    functional_score = Column(Float, nullable=True)
+    security_score = Column(Float, nullable=True)
+    performance_score = Column(Float, nullable=True)
+    accessibility_score = Column(Float, nullable=True)
 
     started_at = Column(DateTime(timezone=True), nullable=True)
     completed_at = Column(DateTime(timezone=True), nullable=True)

@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 from workers.celery_app import celery_app
 from test_engine.browser.pool import BrowserPool
 from test_engine.browser.context import ContextFactory
+from test_engine.browser.readiness import wait_for_page_ready
 from test_engine.pillars.functional.runner import FunctionalScanner
 from test_engine.crawl import CrawlResult, SiteCrawler, redact_url
 from test_engine.pillars.security.runner import SecurityScanner
@@ -71,6 +72,12 @@ async def _persist_scan_success(
                 run.completed_at = datetime.now(timezone.utc)
                 if note:
                     run.error_message = note
+                # Denormalize pillar scores onto the run for fast list filtering
+                pillar_results = report_data.get("pillar_results", {})
+                run.functional_score = (pillar_results.get("functional") or {}).get("score")
+                run.security_score = (pillar_results.get("security") or {}).get("score")
+                run.performance_score = (pillar_results.get("performance") or {}).get("score")
+                run.accessibility_score = (pillar_results.get("accessibility") or {}).get("score")
                 if artifacts:
                     for art in artifacts:
                         abs_p = os.path.join(settings.STORAGE_DIR, art["relative_path"])
@@ -338,19 +345,65 @@ async def _async_execute_scan(
         if creds:
             await ScanProgressTracker.log(run_id, "AUTHENTICATING", f"Executing authentication flow on {creds.get('login_url', target_url)}", 12)
             await _perform_authentication(page, creds)
+            # After login the app may redirect to its default landing page (e.g. /home).
+            # Navigate back to the requested target module before crawling.
+            if page.url.rstrip("/") != target_url.rstrip("/"):
+                try:
+                    await page.goto(target_url, wait_until="domcontentloaded", timeout=20000)
+                except Exception:
+                    pass
 
-        # Discover and visit safe, in-scope links starting from landing URL (e.g., authenticated dashboard)
-        start_crawl_url = page.url if page.url and page.url != "about:blank" else target_url
+        # Always crawl from the requested target URL, not the post-login landing page.
+        # After authentication the app may redirect to /home; we must navigate back to
+        # the actual target so the crawler and all pillar scanners see the right module.
+        start_crawl_url = target_url
+        crawl_depth = int(profile.get("max_crawl_depth", 5))
+        # depth=0 means scan only the target page itself (no link following).
+        # depth=1 means target + its direct children. Keeps module scans focused.
+        crawl_max_pages = 1 if crawl_depth == 0 else 100
+        human_mode = bool(test_pack_yaml)
+        use_ai = not human_mode
+        page_interaction_results: List[Dict[str, Any]] = []
+        functional_scanner = FunctionalScanner()
+
+        async def explore_page_before_following_links(browser_page, crawled_page):
+            """Complete this page's safe interaction pass before the crawler follows its links."""
+            if not (profile["check_functional"] and use_ai):
+                return
+            if await _is_cancelled(run_id):
+                raise asyncio.CancelledError("Scan cancelled during page interaction exploration")
+            page_url = crawled_page.final_url or crawled_page.url
+            await ScanProgressTracker.log(
+                run_id,
+                "FUNCTIONAL",
+                f"Testing interactive controls on {redact_url(page_url)} before following linked pages...",
+                18,
+            )
+            journey = await functional_scanner.explore_crawled_page(
+                page=browser_page,
+                target_url=page_url,
+                run_id=run_id,
+                initial_status_code=crawled_page.status_code,
+                page_ready=bool((crawled_page.page_observations or {}).get("interactive_ready", False)),
+                ai_test_goals=profile.get("ai_test_goals") or opts.get("ai_test_goals") or "",
+                max_react_actions=int(profile.get("max_react_actions") or opts.get("max_react_actions") or 25),
+                cancellation_check=lambda: _is_cancelled(run_id),
+            )
+            journey["page_url"] = redact_url(page_url)
+            page_interaction_results.append(journey)
+
         await ScanProgressTracker.log(run_id, "CRAWLING", "Crawling in-scope routes and analyzing site structure...", 15)
         crawl_result = await SiteCrawler.crawl(
             page,
             start_crawl_url,
             set(allowed_domains),
-            max_pages=100,
-            max_depth=5,
+            max_pages=crawl_max_pages,
+            max_depth=crawl_depth,
             # Reserve time for the four pillar scanners and report persistence.
             timeout_seconds=max(5, int(profile["timeout_seconds"] * 0.6)),
             request_rate_limit=int(profile["rate_limit"]),
+            include_sitemap_urls=bool(profile.get("include_sitemap_urls", False)),
+            page_callback=explore_page_before_following_links,
             cancellation_check=lambda: _is_cancelled(run_id),
         )
 
@@ -360,8 +413,6 @@ async def _async_execute_scan(
 
         # Two exclusive modes: a human-written test pack means NO AI anywhere in the scan
         # (no AI test writing, failure explanations, accessibility fixes, or screenshot review).
-        human_mode = bool(test_pack_yaml)
-        use_ai = not human_mode
         partial["test_case_mode"] = "human" if human_mode else "ai"
 
         # 1. Functional Pillar (the authored test pack runs against its starting page).
@@ -378,6 +429,9 @@ async def _async_execute_scan(
             )
         elif profile.get("use_ai_generation", True) and profile.get("ai_test_goals"):
             await ScanProgressTracker.log(run_id, "FUNCTIONAL", "Synthesizing AI test scenarios for target goals...", 22)
+            if page.url.rstrip("/") != target_url.rstrip("/"):
+                await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+            await wait_for_page_ready(page)
             ai_cases = await _discover_and_generate_ai_tests(page, profile)
             test_cases.extend(ai_cases)
 
@@ -399,7 +453,7 @@ async def _async_execute_scan(
                             target_url = fallback_url
                         except Exception:
                             pass
-            func_result = await FunctionalScanner().scan(
+            func_result = await functional_scanner.scan(
                 page,
                 target_url,
                 test_cases=test_cases,
@@ -408,6 +462,10 @@ async def _async_execute_scan(
                 use_ai=use_ai,
                 crawl_result=crawl_result,
                 initial_status_code=response.status if response else None,
+                ai_test_goals=profile.get("ai_test_goals") or opts.get("ai_test_goals") or "",
+                max_react_actions=int(profile.get("max_react_actions") or opts.get("max_react_actions") or 25),
+                precomputed_ai_journeys=page_interaction_results,
+                skip_ai_journey=bool(use_ai),
             )
             if use_ai and profile.get("ai_explain_failures", True) and func_result.findings:
                 await ScanProgressTracker.log(run_id, "FUNCTIONAL", "Diagnosing functional failures with AI...", 40)
@@ -631,6 +689,18 @@ def execute_website_scan(
 ):
     """Celery task entrypoint."""
     logger.info(f"Starting automated scan task for run {run_id} on {redact_url(target_url)}")
+
+    # Dispose the async engine's connection pool before creating a new event loop.
+    # asyncpg connections are bound to the event loop they were created in; pooled
+    # connections from a previous task's loop become invalid once that loop is closed,
+    # causing "Event loop is closed" / "Future attached to a different loop" errors.
+    try:
+        from app.core.database import engine as _async_engine
+        import asyncio as _asyncio
+        _asyncio.run(_async_engine.dispose())
+    except Exception as _e:
+        logger.debug(f"Engine dispose skipped: {_e}")
+
     effective_profile = {**(options or {}), **(scan_profile or {})}
     # Allow at least 300s (5 minutes) so that crawler + multi-step AI ReAct journey can complete
     raw_timeout = int(effective_profile.get("timeout_seconds") or 300)

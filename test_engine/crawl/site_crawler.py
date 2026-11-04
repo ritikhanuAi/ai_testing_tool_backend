@@ -8,6 +8,7 @@ from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlsplit, urlun
 
 from pydantic import BaseModel, Field
 from playwright.async_api import Page
+from test_engine.browser.readiness import wait_for_page_ready
 from test_engine.pillars.performance.vitals import CoreWebVitalsScanner
 
 
@@ -101,6 +102,9 @@ class CrawlResult(BaseModel):
         summary["pages_attempted"] = len(self.pages)
         summary["pages_with_response"] = sum(page.status_code is not None for page in self.pages)
         summary["pages_with_navigation_errors"] = sum(page.navigation_error is not None for page in self.pages)
+        summary["pages_with_interactions_blocked"] = sum(
+            page.page_observations.get("interactive_ready") is False for page in self.pages
+        )
         summary["max_depth_reached"] = max((page.depth for page in self.pages), default=0)
         summary["coverage_complete"] = not any((
             self.truncated_by_page_limit,
@@ -110,6 +114,7 @@ class CrawlResult(BaseModel):
             self.skipped_depth_limit,
             self.skipped_unsafe,
             any(page.navigation_error for page in self.pages),
+            any(page.page_observations.get("interactive_ready") is False for page in self.pages),
         ))
         return summary
 
@@ -290,6 +295,8 @@ class SiteCrawler:
         timeout_seconds: int = 300,
         max_links_per_page: int = MAX_LINKS_PER_PAGE,
         request_rate_limit: int = 10,
+        include_sitemap_urls: bool = True,
+        page_callback: Optional[Callable[[Page, CrawledPage], Awaitable[None]]] = None,
         cancellation_check: Optional[Callable[[], Awaitable[bool]]] = None,
     ) -> CrawlResult:
         """Visit pages breadth-first within explicit page, depth, time, and host limits."""
@@ -329,26 +336,27 @@ class SiteCrawler:
             cdp_session = None
 
         try:
-            sitemap_deadline = min(started + timeout_seconds, time.monotonic() + max(2.0, min(15.0, timeout_seconds * 0.1)))
-            sitemap_urls, sitemap_files_checked, sitemap_truncated, sitemap_out_of_scope, sitemap_unsafe = await cls._discover_sitemap_urls(
-                page,
-                start,
-                allowed_domains,
-                start_port,
-                sitemap_deadline,
-            )
-            result.sitemap_files_checked = sitemap_files_checked
-            result.sitemap_truncated = sitemap_truncated
-            result.sitemap_urls_discovered = len(sitemap_urls)
-            result.skipped_out_of_scope += sitemap_out_of_scope
-            result.skipped_unsafe += sitemap_unsafe
-            for sitemap_url in sitemap_urls:
-                if sitemap_url not in enqueued:
-                    enqueued.add(sitemap_url)
-                    if max_depth >= 1:
-                        queue.append((sitemap_url, 1))
-                    else:
-                        depth_limited.add(sitemap_url)
+            if include_sitemap_urls:
+                sitemap_deadline = min(started + timeout_seconds, time.monotonic() + max(2.0, min(15.0, timeout_seconds * 0.1)))
+                sitemap_urls, sitemap_files_checked, sitemap_truncated, sitemap_out_of_scope, sitemap_unsafe = await cls._discover_sitemap_urls(
+                    page,
+                    start,
+                    allowed_domains,
+                    start_port,
+                    sitemap_deadline,
+                )
+                result.sitemap_files_checked = sitemap_files_checked
+                result.sitemap_truncated = sitemap_truncated
+                result.sitemap_urls_discovered = len(sitemap_urls)
+                result.skipped_out_of_scope += sitemap_out_of_scope
+                result.skipped_unsafe += sitemap_unsafe
+                for sitemap_url in sitemap_urls:
+                    if sitemap_url not in enqueued:
+                        enqueued.add(sitemap_url)
+                        if max_depth >= 1:
+                            queue.append((sitemap_url, 1))
+                        else:
+                            depth_limited.add(sitemap_url)
 
             while queue and len(result.pages) < max_pages:
                 if cancellation_check and await cancellation_check():
@@ -425,6 +433,8 @@ class SiteCrawler:
                             await page.wait_for_load_state("load", timeout=load_wait_ms)
                         except Exception:
                             pass
+                    remaining_ms = max(1, int((timeout_seconds - (time.monotonic() - started)) * 1000))
+                    interactive_ready = await wait_for_page_ready(page, timeout_ms=min(12000, remaining_ms))
                     eval_result = await page.evaluate(
                         """() => ({
                             links: Array.from(document.querySelectorAll('a[href]'))
@@ -453,6 +463,7 @@ class SiteCrawler:
                         })"""
                     )
                     observations = eval_result if isinstance(eval_result, dict) else {}
+                    observations.setdefault("page", {})["interactive_ready"] = interactive_ready
                     links = observations.get("links", [])
                     observations["performance"] = await CoreWebVitalsScanner.collect_metrics(page)
                     observations["page"]["js_error_count"] = js_error_count[0]
@@ -502,7 +513,7 @@ class SiteCrawler:
                             else:
                                 depth_limited.add(link)
 
-                result.pages.append(CrawledPage(
+                crawled_page = CrawledPage(
                     url=current_url,
                     final_url=final_url,
                     depth=depth,
@@ -515,7 +526,11 @@ class SiteCrawler:
                         "performance": observations.get("performance", {}) if isinstance(observations, dict) else {},
                     },
                     navigation_error=navigation_error,
-                ))
+                )
+                result.pages.append(crawled_page)
+                # Finish this page's interaction pass before following its queued links.
+                if page_callback and navigation_error is None:
+                    await page_callback(page, crawled_page)
                 result.discovered_url_count = len(enqueued)
 
             result.skipped_depth_limit = len(depth_limited)

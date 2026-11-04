@@ -12,6 +12,10 @@ class AIEngineConfig(BaseModel):
     remote_llm_api_key: str = os.getenv("REMOTE_LLM_API_KEY", getattr(settings, "REMOTE_LLM_API_KEY", "hanuai@321"))
     remote_llm_model: str = os.getenv("REMOTE_LLM_MODEL", getattr(settings, "REMOTE_LLM_MODEL", "Qwen3.8-27B-GGUF"))
 
+    # Gemini (Google) — OpenAI-compatible endpoint
+    gemini_api_key: str = os.getenv("GEMINI_API_KEY", getattr(settings, "GEMINI_API_KEY", ""))
+    gemini_model: str = os.getenv("GEMINI_MODEL", getattr(settings, "GEMINI_MODEL", "gemini-2.0-flash"))
+
     timeout_seconds: int = int(os.getenv("AI_TIMEOUT_SECONDS", getattr(settings, "AI_TIMEOUT_SECONDS", 60)))
 
 ai_config = AIEngineConfig()

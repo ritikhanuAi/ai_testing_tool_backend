@@ -651,6 +651,38 @@ async def discover_site_modules(request_data: DiscoverModulesRequest) -> Discove
         if not deduped:
             deduped = [{"name": "Home", "url": post_login_url, "depth": 0}]
 
+        # --- Interconnected module discovery: follow each top-level module and extract sub-pages ---
+        # Only do this when we found a reasonable set of top-level modules (to avoid slow scans on trivial sites)
+        if len(deduped) >= 2:
+            top_level_urls = [m["url"] for m in deduped[:12]]  # cap to avoid too many requests
+            for module_url in top_level_urls:
+                try:
+                    await page.goto(module_url, wait_until="domcontentloaded", timeout=15000)
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=5000)
+                    except Exception:
+                        pass
+                    sub_raw: list[dict] = await page.evaluate(_NAV_EXTRACTION_JS)
+                    for item in sub_raw:
+                        href = item.get("url", "")
+                        if not href:
+                            continue
+                        try:
+                            normalized, classification = SiteCrawler._normalize_link(
+                                href, module_url, allowed_domains, root_port
+                            )
+                        except Exception:
+                            continue
+                        if classification == "ok" and normalized and normalized not in seen_urls:
+                            seen_urls.add(normalized)
+                            name = item.get("name", "").strip()
+                            deduped.append({"name": name, "url": normalized, "depth": 2})
+                            logger.debug("  sub-module: %r -> %s (from %s)", name, normalized, module_url)
+                except Exception as e:
+                    logger.debug("Sub-module discovery failed for %s: %s", module_url, e)
+
+            logger.info("Module discovery: after sub-page scan, total modules = %d", len(deduped))
+
         goals_map = await _generate_goals_for_modules(deduped)
         elapsed_ms = round((time.perf_counter() - start) * 1000, 1)
 
