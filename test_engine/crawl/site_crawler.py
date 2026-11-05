@@ -83,6 +83,7 @@ class CrawlResult(BaseModel):
     skipped_unsafe: int = 0
     skipped_link_limit: int = 0
     skipped_depth_limit: int = 0
+    stopped_after_incomplete_page: bool = False
     truncated_by_page_limit: bool = False
     truncated_by_timeout: bool = False
     truncated_by_link_limit: bool = False
@@ -111,7 +112,8 @@ class CrawlResult(BaseModel):
             self.truncated_by_timeout,
             self.truncated_by_link_limit,
             self.sitemap_truncated,
-            self.skipped_depth_limit,
+            self.skipped_depth_limit if self.max_depth_limit > 0 else 0,
+            self.stopped_after_incomplete_page,
             self.skipped_unsafe,
             any(page.navigation_error for page in self.pages),
             any(page.page_observations.get("interactive_ready") is False for page in self.pages),
@@ -296,7 +298,7 @@ class SiteCrawler:
         max_links_per_page: int = MAX_LINKS_PER_PAGE,
         request_rate_limit: int = 10,
         include_sitemap_urls: bool = True,
-        page_callback: Optional[Callable[[Page, CrawledPage], Awaitable[None]]] = None,
+        page_callback: Optional[Callable[[Page, CrawledPage], Awaitable[Optional[bool]]]] = None,
         cancellation_check: Optional[Callable[[], Awaitable[bool]]] = None,
     ) -> CrawlResult:
         """Visit pages breadth-first within explicit page, depth, time, and host limits."""
@@ -530,7 +532,10 @@ class SiteCrawler:
                 result.pages.append(crawled_page)
                 # Finish this page's interaction pass before following its queued links.
                 if page_callback and navigation_error is None:
-                    await page_callback(page, crawled_page)
+                    continue_crawl = await page_callback(page, crawled_page)
+                    if continue_crawl is False:
+                        result.stopped_after_incomplete_page = True
+                        queue.clear()
                 result.discovered_url_count = len(enqueued)
 
             result.skipped_depth_limit = len(depth_limited)

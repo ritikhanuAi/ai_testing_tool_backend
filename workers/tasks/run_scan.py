@@ -364,21 +364,75 @@ async def _async_execute_scan(
         human_mode = bool(test_pack_yaml)
         use_ai = not human_mode
         page_interaction_results: List[Dict[str, Any]] = []
+        page_combinatorial_results: List[Dict[str, Any]] = []
         functional_scanner = FunctionalScanner()
+        exhaustive_interactions = bool(profile.get("exhaustive_interactions", True))
+        crawl_budget_seconds = max(5, int(profile["timeout_seconds"] * 0.85))
+        interaction_deadline = time.monotonic() + crawl_budget_seconds
 
         async def explore_page_before_following_links(browser_page, crawled_page):
             """Complete this page's safe interaction pass before the crawler follows its links."""
             if not (profile["check_functional"] and use_ai):
-                return
+                return True
             if await _is_cancelled(run_id):
                 raise asyncio.CancelledError("Scan cancelled during page interaction exploration")
             page_url = crawled_page.final_url or crawled_page.url
+            if not bool((crawled_page.page_observations or {}).get("interactive_ready", False)):
+                blocked = {
+                    "mode": "exhaustive_cartesian" if exhaustive_interactions else "ai_exploratory",
+                    "page_url": redact_url(page_url),
+                    "factors_discovered": 0,
+                    "planned_cases": 0,
+                    "executed_cases": 0,
+                    "passed_cases": 0,
+                    "failed_cases": 0,
+                    "blocked_cases": 0,
+                    "pending_cases": 0,
+                    "case_limit": int(profile.get("max_generated_cases") or 1000),
+                    "limit_exceeded": False,
+                    "action_order_permutations": bool(profile.get("include_action_order_permutations", False)),
+                    "complete": False,
+                    "interruption_reason": "The page did not reach an interactive ready state; no controls were tested.",
+                    "test_cases": [],
+                }
+                if exhaustive_interactions:
+                    page_combinatorial_results.append(blocked)
+                else:
+                    page_interaction_results.append({
+                        "actions": 0, "completed": False, "counted": False, "passed": False,
+                        "findings": [], "history": [], "visual_paths": [], "page_url": redact_url(page_url),
+                    })
+                return False
             await ScanProgressTracker.log(
                 run_id,
                 "FUNCTIONAL",
                 f"Testing interactive controls on {redact_url(page_url)} before following linked pages...",
                 18,
             )
+            if exhaustive_interactions:
+                matrix = await functional_scanner.test_crawled_page_combinations(
+                    page=browser_page,
+                    target_url=page_url,
+                    run_id=run_id,
+                    text_values=list(profile.get("interaction_test_values") or []),
+                    max_generated_cases=int(profile.get("max_generated_cases") or 1000),
+                    include_action_order_permutations=bool(profile.get("include_action_order_permutations", False)),
+                    deadline=interaction_deadline,
+                    cancellation_check=lambda: _is_cancelled(run_id),
+                )
+                matrix["page_url"] = redact_url(page_url)
+                page_combinatorial_results.append(matrix)
+                await ScanProgressTracker.log(
+                    run_id,
+                    "FUNCTIONAL",
+                    f"Page matrix finished: {matrix.get('executed_cases', 0)}/{matrix.get('planned_cases', 0)} cases executed; "
+                    f"{matrix.get('pending_cases', 0)} pending.",
+                    30,
+                    level="WARNING" if not matrix.get("complete") else "INFO",
+                )
+                # Do not traverse linked routes until this page's full manifest is complete.
+                return bool(matrix.get("complete"))
+
             journey = await functional_scanner.explore_crawled_page(
                 page=browser_page,
                 target_url=page_url,
@@ -391,6 +445,7 @@ async def _async_execute_scan(
             )
             journey["page_url"] = redact_url(page_url)
             page_interaction_results.append(journey)
+            return bool(journey.get("completed"))
 
         await ScanProgressTracker.log(run_id, "CRAWLING", "Crawling in-scope routes and analyzing site structure...", 15)
         crawl_result = await SiteCrawler.crawl(
@@ -399,8 +454,8 @@ async def _async_execute_scan(
             set(allowed_domains),
             max_pages=crawl_max_pages,
             max_depth=crawl_depth,
-            # Reserve time for the four pillar scanners and report persistence.
-            timeout_seconds=max(5, int(profile["timeout_seconds"] * 0.6)),
+            # Reserve the final 15% for pillars, report persistence, and artifacts.
+            timeout_seconds=crawl_budget_seconds,
             request_rate_limit=int(profile["rate_limit"]),
             include_sitemap_urls=bool(profile.get("include_sitemap_urls", False)),
             page_callback=explore_page_before_following_links,
@@ -427,7 +482,7 @@ async def _async_execute_scan(
                 f"Human test pack mode: running {len(test_cases)} human-written test case(s); AI is turned off for this scan",
                 22,
             )
-        elif profile.get("use_ai_generation", True) and profile.get("ai_test_goals"):
+        elif not exhaustive_interactions and profile.get("use_ai_generation", True) and profile.get("ai_test_goals"):
             await ScanProgressTracker.log(run_id, "FUNCTIONAL", "Synthesizing AI test scenarios for target goals...", 22)
             if page.url.rstrip("/") != target_url.rstrip("/"):
                 await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
@@ -436,7 +491,11 @@ async def _async_execute_scan(
             test_cases.extend(ai_cases)
 
         if profile["check_functional"]:
-            cases_label = f"{len(test_cases)} authored test cases" if test_cases else "autonomous form discovery & AI interaction exploration"
+            cases_label = (
+                f"{len(test_cases)} authored test cases" if test_cases else
+                "exhaustive page interaction matrix" if exhaustive_interactions and use_ai else
+                "autonomous form discovery & AI interaction exploration"
+            )
             await ScanProgressTracker.log(run_id, "FUNCTIONAL", f"Running Functional Pillar: Executing {cases_label}...", 25)
             response = None
             try:
@@ -465,6 +524,8 @@ async def _async_execute_scan(
                 ai_test_goals=profile.get("ai_test_goals") or opts.get("ai_test_goals") or "",
                 max_react_actions=int(profile.get("max_react_actions") or opts.get("max_react_actions") or 25),
                 precomputed_ai_journeys=page_interaction_results,
+                precomputed_combinatorial_results=page_combinatorial_results,
+                exhaustive_interactions=exhaustive_interactions and use_ai,
                 skip_ai_journey=bool(use_ai),
             )
             if use_ai and profile.get("ai_explain_failures", True) and func_result.findings:
@@ -599,11 +660,30 @@ async def _async_execute_scan(
         report_dict["test_cases"] = func_result.metrics.get("executed_test_cases", [])
         report_dict["test_case_mode"] = "human" if human_mode else "ai"
         report_dict["ai_used"] = use_ai
-        await _persist_scan_success(run_id, report_dict, artifacts=artifacts)
+        coverage_pending = int(func_result.metrics.get("pending_combinatorial_cases") or 0)
+        coverage_complete = bool(func_result.metrics.get("combinatorial_coverage_complete", True))
+        coverage_note = None
+        if exhaustive_interactions and use_ai and not coverage_complete:
+            coverage_pages = func_result.metrics.get("combinatorial_pages") or []
+            coverage_reasons = [
+                str(item.get("interruption_reason"))
+                for item in coverage_pages
+                if item.get("interruption_reason")
+            ]
+            reason_text = " ".join(coverage_reasons[:3]) or "No complete page matrix was recorded."
+            coverage_note = (
+                f"Coverage incomplete: {coverage_pending} interaction cases remain pending. {reason_text} "
+                "Review the functional coverage details and adjust the case limit, finite values, or scan timeout before rerunning."
+            )
+            report_dict["incomplete"] = True
+            report_dict["incomplete_reason"] = coverage_note
+            report_dict["passed"] = False
+        await _persist_scan_success(run_id, report_dict, artifacts=artifacts, note=coverage_note)
         await ScanProgressTracker.log(
             run_id, "COMPLETED",
-            f"Audit finished successfully! Overall Score: {unified_report.overall_score}/100, Grade: {unified_report.grade}",
-            100
+            coverage_note or f"Audit finished successfully! Overall Score: {unified_report.overall_score}/100, Grade: {unified_report.grade}",
+            100,
+            level="WARNING" if coverage_note else "INFO",
         )
         return report_dict
 

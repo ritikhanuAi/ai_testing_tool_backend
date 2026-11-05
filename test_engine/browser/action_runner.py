@@ -47,15 +47,71 @@ class ActionRunner:
                 }
 
             elif step.action == ActionType.SELECT_OPTION:
-                try:
-                    await locator.select_option(label=str(step.value), timeout=timeout)
-                except Exception:
-                    await locator.select_option(value=str(step.value), timeout=timeout)
+                tag_name = await locator.evaluate("element => element.tagName.toLowerCase()")
+                if tag_name == "select":
+                    if step.select_by_value:
+                        await locator.select_option(value=str(step.value), timeout=timeout)
+                    else:
+                        try:
+                            await locator.select_option(label=str(step.value), timeout=timeout)
+                        except Exception:
+                            await locator.select_option(value=str(step.value), timeout=timeout)
+                else:
+                    await locator.click(timeout=timeout)
+                    option = page.get_by_role("option", name=str(step.value), exact=True)
+                    if await option.count() == 0:
+                        option = page.get_by_role("menuitem", name=str(step.value), exact=True)
+                    await option.wait_for(state="visible", timeout=timeout)
+                    await option.click(timeout=timeout)
                 return {
                     "action": step.action.value,
                     "target": step.target,
                     "status": "PASSED",
                     "details": f"Selected option '{step.value}'"
+                }
+
+            elif step.action == ActionType.SET_CHECKED:
+                checked = str(step.value).strip().lower() in {"true", "1", "yes", "checked"}
+                tag_name = await locator.evaluate("element => element.tagName.toLowerCase()")
+                role = await locator.get_attribute("role")
+                if tag_name == "input" and await locator.get_attribute("type") in {"checkbox", "radio"}:
+                    await locator.set_checked(checked, timeout=timeout)
+                    actual = await locator.is_checked(timeout=timeout)
+                elif role in {"checkbox", "switch", "radio"}:
+                    before = (await locator.get_attribute("aria-checked")) == "true"
+                    if before != checked:
+                        await locator.click(timeout=timeout)
+                    actual = (await locator.get_attribute("aria-checked")) == "true"
+                else:
+                    raise ValueError("set_checked requires a checkbox, switch, or radio control")
+                return {
+                    "action": step.action.value,
+                    "target": step.target,
+                    "status": "PASSED" if actual == checked else "FAILED",
+                    "details": f"Set checked state to {checked}; observed {actual}",
+                    "expected": checked,
+                    "actual": actual,
+                }
+
+            elif step.action == ActionType.SET_RANGE:
+                value = str(step.value or "")
+                await locator.evaluate(
+                    """(element, nextValue) => {
+                        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                        setter.call(element, nextValue);
+                        element.dispatchEvent(new Event('input', { bubbles: true }));
+                        element.dispatchEvent(new Event('change', { bubbles: true }));
+                    }""",
+                    value,
+                )
+                actual = await locator.input_value(timeout=timeout)
+                return {
+                    "action": step.action.value,
+                    "target": step.target,
+                    "status": "PASSED" if actual == value else "FAILED",
+                    "details": f"Set range value to {value}; observed {actual}",
+                    "expected": value,
+                    "actual": actual,
                 }
 
             elif step.action == ActionType.DOWNLOAD:

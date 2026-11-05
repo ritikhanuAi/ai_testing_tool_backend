@@ -29,6 +29,7 @@ class FunctionalSpider:
                     const tag = el.tagName.toLowerCase();
                     const type = (el.getAttribute('type') || '').toLowerCase();
                     if (/^h[1-6]$/.test(tag)) return 'heading';
+                    if ((el.getAttribute('aria-haspopup') || '').toLowerCase() === 'listbox') return 'combobox';
                     if (tag === 'button' || (tag === 'input' && ['button', 'submit', 'reset', 'image'].includes(type))) return 'button';
                     if (tag === 'a' && el.hasAttribute('href')) return 'link';
                     if (tag === 'select') return 'combobox';
@@ -90,7 +91,7 @@ class FunctionalSpider:
                     return roleFor(el) && !el.disabled && !el.hidden && el.getAttribute('aria-disabled') !== 'true' &&
                         el.getAttribute('aria-hidden') !== 'true' &&
                         style.display !== 'none' && style.visibility !== 'hidden' && el.getClientRects().length > 0;
-                }).slice(0, 60).map(el => {
+                }).map(el => {
                     const tag = el.tagName.toLowerCase();
                     const attributeType = (el.getAttribute('type') || '').toLowerCase();
                     const type = tag === 'input' ? (attributeType || 'text') :
@@ -102,18 +103,24 @@ class FunctionalSpider:
                         /(^|\s)(current-password|new-password|username|one-time-code)(\s|$)/.test(el.getAttribute('autocomplete') || '');
                     const selector = cssPath(el);
                     const form = el.closest('form') || el.form;
+                    const radioName = el.getAttribute('name') || '';
+                    const radioGroup = el.closest('[role="radiogroup"]');
+                    const tabList = el.closest('[role="tablist"]');
+                    const groupKey = role === 'radio' ? `radio:${radioGroup ? cssPath(radioGroup) : `${form ? formId(form) : 'page'}:${radioName || selector}`}` :
+                        role === 'tab' && tabList ? `tablist:${cssPath(tabList)}` : null;
                     const isSubmit = tag === 'button' ? (attributeType === 'submit' || (!attributeType && !!form)) :
                         tag === 'input' && ['submit', 'image'].includes(type);
                     const lowerName = name.toLowerCase();
                     const riskyName = /\b(submit|save|delete|remove|pay|purchase|checkout|send|create|update|register|sign ?up|log ?out|confirm|buy|order|post|publish|upload|book|reserve|transfer|unsubscribe)\b/.test(lowerName);
                     const allowedActions = [];
                     if (['textbox', 'searchbox'].includes(role) && !credentialControl) allowedActions.push('type_text');
+                    if (role === 'slider' && type === 'range' && !credentialControl) allowedActions.push('set_range');
                     // Allow select_option for <select> even inside forms — selecting an option doesn't submit the form.
-                    if (role === 'combobox' && name && tag === 'select') allowedActions.push('select_option');
+                    if (role === 'combobox' && tag === 'select') allowedActions.push('select_option');
                     // Allow click for non-select combobox (custom dropdowns) regardless of form context.
-                    if (role === 'combobox' && name && tag !== 'select') allowedActions.push('click');
-                    if (['checkbox', 'radio'].includes(role) && name && !riskyName) allowedActions.push('click');
-                    if (['tab', 'menuitem'].includes(role) && name && !riskyName) allowedActions.push('click');
+                    if (role === 'combobox' && tag !== 'select') allowedActions.push('click');
+                    if (['checkbox', 'radio', 'switch'].includes(role) && !riskyName) allowedActions.push('click');
+                    if (['tab', 'menuitem'].includes(role) && !riskyName) allowedActions.push('click');
                     // Allow non-submit, non-risky buttons even inside forms (filter/clear/search buttons).
                     if (role === 'button' && name && !isSubmit && !riskyName) allowedActions.push('click');
                     if (['button', 'link', 'tab', 'menuitem'].includes(role)) allowedActions.push('hover');
@@ -126,12 +133,22 @@ class FunctionalSpider:
                         role,
                         name,
                         placeholder: el.getAttribute('placeholder') || '',
+                        has_popup: el.getAttribute('aria-haspopup') || null,
                         required: !!el.required || el.getAttribute('aria-required') === 'true',
                         selected_value: tag === 'select' ? el.value : null,
+                        checked: ['checkbox', 'radio'].includes(role) ? !!el.checked :
+                            role === 'switch' ? el.getAttribute('aria-checked') === 'true' : null,
+                        value: ['checkbox', 'radio'].includes(role) ? (el.value || '') : null,
+                        selected: role === 'tab' ? el.getAttribute('aria-selected') === 'true' : null,
+                        group_key: groupKey,
+                        range_min: role === 'slider' ? el.min : null,
+                        range_max: role === 'slider' ? el.max : null,
+                        range_step: role === 'slider' ? el.step : null,
+                        range_value: role === 'slider' ? el.value : null,
                         form_id: form ? formId(form) : null,
                         is_submit: isSubmit,
                         allowed_actions: allowedActions,
-                        options: tag === 'select' ? Array.from(el.options).map(option => ({label: option.label, value: option.value})).slice(0, 20) : []
+                        options: tag === 'select' ? Array.from(el.options).map(option => ({label: option.label, value: option.value, disabled: !!option.disabled})) : []
                     };
                 });
                 const formsData = forms.map((form, index) => {

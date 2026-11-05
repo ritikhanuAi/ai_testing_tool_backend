@@ -48,3 +48,4 @@
 | :--- | :--- | :--- | :--- |
 | 2026-10-23 | Setup | `AI_ENGINE_AND_PILLARS_BLUEPRINT.md` | Master plan approved and blueprint published. |
 | 2026-10-23 | Setup | `PROGRESS_LOG.md` | Progress tracker established. |
+| 2026-11-05 | Module testing | `AI_TESTING_GAPS_AND_ROADMAP.md`, `test_engine/pillars/functional/`, `workers/tasks/run_scan.py`, frontend module/report UI | Implemented selected-page interaction matrices, sequential module control, per-case route resets, coverage reporting, button grouping, and bounded-prefix execution; documented continuation/resume and automated test coverage as remaining work. |

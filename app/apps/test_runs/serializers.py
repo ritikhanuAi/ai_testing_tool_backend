@@ -39,11 +39,32 @@ class AdvancedExecutionOptions(BaseModel):
     max_crawl_depth: int = 2            # Exploration depth
     include_sitemap_urls: bool = False  # Module scans follow links from the selected page only
 
+    # Deterministic interaction matrix controls
+    exhaustive_interactions: bool = True
+    interaction_test_values: List[str] = Field(
+        default_factory=lambda: ["sample", "__no_matching_result__"],
+        max_length=20,
+        description="Finite values used for discovered text and search controls; an empty value is always included.",
+    )
+    include_action_order_permutations: bool = False
+    max_generated_cases: int = Field(default=1000, ge=1, le=100000)
+
     # AI Intelligence Options
     use_ai_generation: bool = True      # Use LLM to author tests dynamically
     ai_test_goals: Optional[str] = None # Natural language intent (e.g. "Test checkout & signup")
     max_ai_cases: int = 5               # Maximum tests for AI to generate
     ai_explain_failures: bool = True    # Use AI to diagnose root causes of defect findings
+
+    @field_validator("interaction_test_values")
+    @classmethod
+    def validate_interaction_test_values(cls, values: List[str]) -> List[str]:
+        cleaned = []
+        for value in values:
+            if len(value) > 500:
+                raise ValueError("Each interaction test value must be 500 characters or fewer")
+            if value not in cleaned:
+                cleaned.append(value)
+        return cleaned
 
 class QuickScanRequest(BaseModel):
     url: str = Field(..., description="Target website entry URL (e.g. https://example.com)")

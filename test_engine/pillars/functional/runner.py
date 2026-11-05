@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import logging
 import re
 import time
@@ -26,6 +27,11 @@ NETWORK_IDLE_QUIET_MS = 500
 from test_engine.schema.case import TestCaseModel
 from test_engine.crawl.site_crawler import CrawlResult, redact_text, redact_url
 from test_engine.scoring.rubrics import calculate_pillar_deductions
+from test_engine.pillars.functional.combinatorial import (
+    discover_interaction_factors,
+    estimate_case_count,
+    execute_interaction_matrix,
+)
 
 logger = logging.getLogger("test_engine.pillars.functional.runner")
 MAX_REACT_ACTIONS = 25  # default; overridable per-scan via kwargs["max_react_actions"]
@@ -149,7 +155,8 @@ class FunctionalScanner(BasePillarScanner):
         max_react_actions = int(kwargs.get("max_react_actions") or MAX_REACT_ACTIONS)
         supplied_cases = bool(test_cases) or not use_ai
         cases = list(test_cases or [])
-        if not supplied_cases:
+        exhaustive_mode = bool(kwargs.get("exhaustive_interactions", False))
+        if not supplied_cases and not exhaustive_mode:
             suite_started = time.perf_counter()
             cases = await AITestCaseGenerator.generate_suite_for_forms(forms, target_url)
             logger.info(
@@ -166,6 +173,55 @@ class FunctionalScanner(BasePillarScanner):
         downloaded_files: List[Dict[str, Any]] = []
         visual_comparison_paths: List[str] = []
         executed_case_records: List[Dict[str, Any]] = []
+        combinatorial_results = kwargs.get("precomputed_combinatorial_results") or []
+        combinatorial_planned = sum(int(item.get("planned_cases") or 0) for item in combinatorial_results)
+        combinatorial_executed = sum(int(item.get("executed_cases") or 0) for item in combinatorial_results)
+        combinatorial_pending = sum(int(item.get("pending_cases") or 0) for item in combinatorial_results)
+        combinatorial_blocked = sum(int(item.get("blocked_cases") or 0) for item in combinatorial_results)
+        combinatorial_complete = not exhaustive_mode or (
+            bool(combinatorial_results) and all(bool(item.get("complete")) for item in combinatorial_results)
+        )
+        seen_matrix_failures = set()
+        for page_matrix in combinatorial_results:
+            for case in page_matrix.get("test_cases", []):
+                executed_case_records.append(case)
+                executed_cases += 1
+                if case.get("passed"):
+                    passed_cases += 1
+                else:
+                    failed_step = next(
+                        (step for step in case.get("steps", []) if step.get("status") in {"FAILED", "BLOCKED"}),
+                        {},
+                    )
+                    failure_target = failed_step.get("target") or case.get("page_url") or target_url
+                    failure_action = failed_step.get("action") or "page_reset"
+                    failure_key = f"{case.get('page_url') or target_url}:{failure_action}:{failure_target}"
+                    if failure_key in seen_matrix_failures:
+                        continue
+                    seen_matrix_failures.add(failure_key)
+                    rule_suffix = hashlib.sha1(failure_key.encode("utf-8")).hexdigest()[:12]
+                    blocked = case.get("status") == "BLOCKED"
+                    findings.append(PillarFinding(
+                        id=f"FUNC-MATRIX-{failure_action.upper()}-{rule_suffix}",
+                        title="Exhaustive interaction could not be completed" if blocked else "Control failed in exhaustive interaction testing",
+                        description=redact_text(str(failed_step.get("error") or case.get("actual_result") or "A discovered control combination did not complete.")),
+                        severity=FindingSeverity.MEDIUM if blocked else FindingSeverity.HIGH,
+                        evidence_path=case.get("evidence_path"),
+                        selector_or_url=failure_target,
+                        suggested_fix="Check the selected page control and repeat the case after fixing the interaction failure.",
+                    ))
+            if page_matrix.get("interruption_reason") and not page_matrix.get("complete"):
+                findings.append(PillarFinding(
+                    id=f"FUNC-MATRIX-INCOMPLETE-{len(findings) + 1}",
+                    title="Exhaustive interaction coverage is incomplete",
+                    description=redact_text(
+                        f"{page_matrix.get('pending_cases', 0)} of {page_matrix.get('planned_cases', 0)} planned cases remain. "
+                        f"{page_matrix.get('interruption_reason')}"
+                    ),
+                    severity=FindingSeverity.MEDIUM,
+                    selector_or_url=page_matrix.get("page_url"),
+                    suggested_fix="Raise the case limit or scan timeout, or reduce the finite test values and enabled permutations, then run the module again.",
+                ))
 
         for case_idx, case in enumerate(cases):
             permitted, _ = RiskPolicyChecker.is_execution_permitted(case, allow_state_changing)
@@ -332,7 +388,7 @@ class FunctionalScanner(BasePillarScanner):
                 })
         # Always run the ReAct journey in AI mode when the page has interactive elements.
         # (supplied_cases only gates the form-pack loop above, not the AI exploration.)
-        if use_ai and catalog and not kwargs.get("skip_ai_journey", False):
+        if use_ai and catalog and not exhaustive_mode and not kwargs.get("skip_ai_journey", False):
             try:
                 # Navigate back to the target and wait for the SPA to fully hydrate before
                 # starting the ReAct journey. domcontentloaded fires before React renders
@@ -521,7 +577,8 @@ class FunctionalScanner(BasePillarScanner):
             or crawl_result.truncated_by_timeout
             or crawl_result.truncated_by_link_limit
             or crawl_result.sitemap_truncated
-            or crawl_result.skipped_depth_limit
+            or (crawl_result.skipped_depth_limit and crawl_result.max_depth_limit > 0)
+            or crawl_result.stopped_after_incomplete_page
             or crawl_result.skipped_unsafe
         ))
         crawl_errors = bool(crawl_result and any(item.navigation_error for item in crawl_result.pages))
@@ -531,7 +588,7 @@ class FunctionalScanner(BasePillarScanner):
         }
         if score < 60 or finding_severity_counts[FindingSeverity.CRITICAL.value]:
             status = "FAILED"
-        elif score < 85 or finding_severity_counts[FindingSeverity.HIGH.value] or not executed_cases or crawl_limited or crawl_errors:
+        elif score < 85 or finding_severity_counts[FindingSeverity.HIGH.value] or not executed_cases or crawl_limited or crawl_errors or not combinatorial_complete:
             status = "WARNING"
         else:
             status = "PASSED"
@@ -543,16 +600,30 @@ class FunctionalScanner(BasePillarScanner):
             status=status,
             findings=findings,
             metrics={
-                "total_cases": len(cases) + react_counted_cases,
+                "total_cases": len(cases) + react_counted_cases + combinatorial_planned,
                 "executed_cases": executed_cases,
                 "passed_cases": passed_cases,
                 "failed_cases": executed_cases - passed_cases,
                 "skipped_cases": skipped_cases,
+                "blocked_cases": combinatorial_blocked,
+                "planned_combinatorial_cases": combinatorial_planned,
+                "executed_combinatorial_cases": combinatorial_executed,
+                "passed_combinatorial_cases": sum(int(item.get("passed_cases") or 0) for item in combinatorial_results),
+                "failed_combinatorial_cases": sum(int(item.get("failed_cases") or 0) for item in combinatorial_results),
+                "pending_combinatorial_cases": combinatorial_pending,
+                "combinatorial_coverage_complete": combinatorial_complete,
+                "combinatorial_pages": [
+                    {key: value for key, value in item.items() if key != "test_cases"}
+                    for item in combinatorial_results
+                ],
                 "executed_test_cases": executed_case_records,
                 "forms_discovered": len(forms),
                 "interactive_elements_discovered": len(catalog),
                 "react_actions": react_actions,
                 "react_completed": react_completed,
+                "interaction_coverage_mode": (
+                    "exhaustive_cartesian" if exhaustive_mode else "ai_exploratory" if use_ai else "authored_cases"
+                ),
                 "page_interaction_journeys": len(precomputed_ai_journeys),
                 "pages_with_interaction_actions": sum(
                     int(item.get("actions") or 0) > 0 for item in precomputed_ai_journeys
@@ -638,6 +709,86 @@ class FunctionalScanner(BasePillarScanner):
         result["page_url"] = redact_url(target_url)
         return result
 
+    async def test_crawled_page_combinations(
+        self,
+        *,
+        page: Page,
+        target_url: str,
+        run_id: str,
+        text_values: Optional[List[str]] = None,
+        max_generated_cases: int = 1000,
+        include_action_order_permutations: bool = False,
+        deadline: Optional[float] = None,
+        cancellation_check: Optional[Callable[[], Awaitable[bool]]] = None,
+    ) -> Dict[str, Any]:
+        """Discover the page's finite factors and run their full Cartesian suite."""
+        discovery = await discover_interaction_factors(
+            page,
+            target_url=target_url,
+            text_values=text_values or [],
+            deadline=deadline,
+            cancellation_check=cancellation_check,
+        )
+        if not discovery.get("discovery_complete", True):
+            planned = estimate_case_count(discovery["factors"], include_action_order_permutations)
+            result = {
+                "mode": "exhaustive_cartesian",
+                "page_url": redact_url(target_url),
+                "factors": [
+                    {"id": factor["id"], "label": factor["label"], "kind": factor["kind"], "values": [value["label"] for value in factor["values"]]}
+                    for factor in discovery["factors"]
+                ],
+                "factors_discovered": len(discovery["factors"]),
+                "planned_cases": planned,
+                "executed_cases": 0,
+                "passed_cases": 0,
+                "failed_cases": 0,
+                "blocked_cases": 0,
+                "pending_cases": planned,
+                "case_limit": max_generated_cases,
+                "limit_exceeded": planned > max_generated_cases,
+                "action_order_permutations": include_action_order_permutations,
+                "complete": False,
+                "interruption_reason": discovery["discovery_errors"][0],
+                "test_cases": [],
+                "dynamic_controls": [],
+            }
+        else:
+            result = await execute_interaction_matrix(
+                page,
+                target_url=target_url,
+                run_id=run_id,
+                factors=discovery["factors"],
+                max_generated_cases=max_generated_cases,
+                include_action_order_permutations=include_action_order_permutations,
+                baseline_controls=discovery.get("control_snapshot"),
+                deadline=deadline,
+                cancellation_check=cancellation_check,
+            )
+        result.update({key: value for key, value in discovery.items() if key not in {"factors", "control_snapshot"}})
+        result["discovery_errors"] = discovery.get("discovery_errors", [])
+        if discovery.get("undiscovered_custom_dropdowns"):
+            result["complete"] = False
+            result["interruption_reason"] = (
+                f"{discovery['undiscovered_custom_dropdowns']} custom dropdown(s) opened without exposing "
+                "accessible option values; their option domains could not be exhaustively enumerated."
+            )
+        if discovery.get("discovery_errors"):
+            result["complete"] = False
+            errors = "; ".join(discovery["discovery_errors"][:3])
+            result["interruption_reason"] = "; ".join(filter(None, [result.get("interruption_reason"), errors]))
+        if discovery.get("unsupported_controls"):
+            result["complete"] = False
+            unsupported = "; ".join(
+                f"{item['label']}: {item['reason']}"
+                for item in discovery["unsupported_controls"][:3]
+            )
+            result["interruption_reason"] = "; ".join(filter(None, [
+                result.get("interruption_reason"),
+                f"Some control domains could not be enumerated: {unsupported}.",
+            ]))
+        return result
+
     async def _run_react_journey(
         self,
         *,
@@ -678,11 +829,11 @@ class FunctionalScanner(BasePillarScanner):
             ))
             return journey_result(completed=False, counted=True, passed=False)
 
-        # Normalise to a trailing-slash form so "/dashboard/road/" never matches
-        # "/dashboard/roadclasses/" as a string prefix.
+        # Each callback owns only its current route. Linked pages are tested later by
+        # the crawler, after this route's interaction pass has completed.
         _target_parts = urlsplit(target_url)
         target_netloc = _target_parts.netloc
-        target_path_prefix = _target_parts.path.rstrip("/") + "/"  # e.g. "/dashboard/road/"
+        target_path = _target_parts.path.rstrip("/") or "/"
 
         for iteration in range(max_react_actions + 1):
             if cancellation_check and await cancellation_check():
@@ -857,12 +1008,12 @@ class FunctionalScanner(BasePillarScanner):
                 "error": redact_text(result.get("error", "")) if result.get("error") else None,
             })
 
-            # URL boundary guard: if the action navigated away from the target module, go back.
-            # Compare with trailing slash so /dashboard/road/ doesn't match /dashboard/roadclasses/.
+            # URL boundary guard: if an interaction navigates away from this page route,
+            # return here and leave linked-route navigation to the crawler.
             current_parts = urlsplit(page.url)
-            current_path_norm = current_parts.path.rstrip("/") + "/"
+            current_path = current_parts.path.rstrip("/") or "/"
             if (current_parts.netloc != target_netloc or
-                    not current_path_norm.startswith(target_path_prefix)):
+                    current_path != target_path):
                 logger.info(
                     f"[run {run_id}] ReAct drifted to {page.url!r} (outside {target_url!r}), navigating back"
                 )

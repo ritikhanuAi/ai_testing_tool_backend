@@ -187,6 +187,27 @@ Extend the Functional and Security pillars by instructing the AI to generate adv
 
 ## 4. Phased Implementation Roadmap
 
+### Module and Page Interaction Matrix — Status (2026-11-05)
+
+The following work was implemented for the requested module-focused testing workflow:
+
+- [x] Module scans default to the selected page only; linked-page traversal is opt-in.
+- [x] Selected modules execute sequentially, with stop/cancel support and visible scan progress.
+- [x] Discover finite domains for native/custom dropdowns, text/search inputs, checkbox/switch states, radio groups, tabs, safe buttons, and discrete sliders.
+- [x] Reset to the selected route for each interaction case and prevent interactions from silently continuing on another route.
+- [x] Finish the current page's interaction queue before following its linked pages; stop traversal when coverage is incomplete.
+- [x] Report planned, executed, passed, failed, blocked, and pending matrix cases, plus undiscovered or changing control domains.
+- [x] Group repeated same-name row buttons as alternatives, and only permute actions selected in a case.
+- [x] Execute the deterministic case prefix up to the configured per-page limit instead of aborting the page with zero cases.
+
+Remaining work before claiming that every planned case will eventually execute:
+
+- [ ] Persist a stable matrix manifest and continuation cursor so a run can resume after the per-run case limit or time budget, without repeating completed cases.
+- [ ] Add automated coverage for domain discovery, matrix counts/order, continuation, route boundaries, cancellation, and incomplete reports.
+- [ ] Improve semantic disambiguation for repeated controls whose accessible names are identical but whose row context changes their meaning.
+
+The current implementation still marks coverage incomplete when the configured case ceiling or scan deadline is reached. It only promises exhaustive coverage over the discovered finite control domains and configured input values; it cannot enumerate arbitrary text or hidden application states.
+
 ### 📍 Sprint 1 (Foundation & Reliability - P0)
 - [ ] **Task 1.1:** Build DOM Distiller to provide real, verified selectors to the LLM.
 - [ ] **Task 1.2:** Upgrade `test_generation.py` to produce a full 3–5 scenario test suite.
