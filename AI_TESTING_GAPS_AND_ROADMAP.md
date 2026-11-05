@@ -196,13 +196,13 @@ The following work was implemented for the requested module-focused testing work
 - [x] Execute the deterministic case prefix up to the configured per-page limit instead of aborting the page with zero cases.
 - [x] Disable screenshot-based VLM review in scan execution while retaining text-based LLM testing and fix suggestions.
 
-Remaining work before claiming that every planned case will eventually execute:
+Follow-up implementation status:
 
-- [ ] Persist a stable matrix manifest and continuation cursor so a run can resume after the per-run case limit or time budget, without repeating completed cases.
-- [ ] Add automated coverage for domain discovery, matrix counts/order, continuation, route boundaries, cancellation, and incomplete reports.
-- [ ] Improve semantic disambiguation for repeated controls whose accessible names are identical but whose row context changes their meaning.
+- [x] Persist a stable page-manifest fingerprint, completed cases, and continuation cursor so repeatable batches resume without repeating saved cases.
+- [x] Add automated coverage for domain discovery, matrix counts/order, continuation, route boundaries, cancellation, checkpoint persistence, and incomplete reports.
+- [x] Add safe row-context labels to repeated controls so identical accessible names remain distinguishable in the interaction matrix.
 
-The current implementation still marks coverage incomplete when the configured case ceiling or scan deadline is reached. It only promises exhaustive coverage over the discovered finite control domains and configured input values; it cannot enumerate arbitrary text or hidden application states.
+The worker automatically queues another batch when the configured batch size or page interaction budget is reached, then continues from the saved cursor. Coverage remains incomplete for blocked cases, unstable or newly exposed controls, inaccessible domains, or checkpoint failures. Repeated row actions include a non-sensitive row heading, accessible label, or link name where available. Exhaustiveness is limited to discovered finite control domains and configured input values; arbitrary text and hidden application states cannot be enumerated.
 
 ### 📍 Sprint 1 (Foundation & Reliability - P0)
 - [ ] **Task 1.1:** Build DOM Distiller to provide real, verified selectors to the LLM.

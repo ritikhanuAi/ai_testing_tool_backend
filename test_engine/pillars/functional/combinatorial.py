@@ -70,7 +70,12 @@ def _group_equivalent_safe_buttons(factors: List[Dict[str, Any]]) -> List[Dict[s
             existing["_button_targets"].add(target)
             ordinal = len(existing["_button_targets"])
             merged_value = {**value}
-            merged_value["label"] = f"click control {ordinal}"
+            context = str(value.get("context_name") or "").strip()
+            label = f"click {context}" if context else f"click control {ordinal}"
+            used_labels = {str(item.get("label") or "") for item in existing["values"]}
+            if label in used_labels:
+                label = f"{label} #{ordinal}"
+            merged_value["label"] = label
             existing["values"].append(merged_value)
 
     for factor in result:
@@ -94,6 +99,7 @@ def _factor_value(
         "value": value,
         "fallback_role": item.get("fallback_role"),
         "fallback_name": item.get("fallback_name"),
+        "context_name": redact_text(str(item.get("context_name") or "")),
         "select_by_value": select_by_value,
     }
 
@@ -266,6 +272,9 @@ async def discover_interaction_factors(
                     })
                 for option_index in range(count):
                     option = options.nth(option_index)
+                    disabled = (await option.get_attribute("aria-disabled") or "").lower() == "true"
+                    if disabled:
+                        continue
                     option_name = (await option.get_attribute("aria-label")) or (await option.inner_text())
                     option_name = " ".join(str(option_name).split())
                     if option_name:
@@ -464,6 +473,38 @@ def estimate_case_count(factors: List[Dict[str, Any]], include_action_order_perm
     return sum(combinations * math.factorial(active_count) for active_count, combinations in active_counts.items())
 
 
+def interaction_manifest_fingerprint(
+    target_url: str,
+    factors: List[Dict[str, Any]],
+    include_action_order_permutations: bool,
+) -> str:
+    """Stable identity for deciding whether a saved page cursor is still valid."""
+    manifest = {
+        "target_url": target_url,
+        "include_action_order_permutations": include_action_order_permutations,
+        "factors": [
+            {
+                "id": factor.get("id"),
+                "kind": factor.get("kind"),
+                "label": factor.get("label"),
+                "values": [
+                    {
+                        "action": value.get("action"),
+                        "target": value.get("target"),
+                        "value": value.get("value"),
+                        "label": value.get("label"),
+                        "select_by_value": bool(value.get("select_by_value")),
+                    }
+                    for value in factor.get("values") or []
+                ],
+            }
+            for factor in factors
+        ],
+    }
+    serialized = json.dumps(manifest, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode()).hexdigest()
+
+
 async def execute_interaction_matrix(
     page: Page,
     *,
@@ -473,11 +514,27 @@ async def execute_interaction_matrix(
     max_generated_cases: int,
     include_action_order_permutations: bool,
     baseline_controls: Optional[Dict[str, Dict[str, Any]]] = None,
+    resume_state: Optional[Dict[str, Any]] = None,
+    checkpoint_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
     deadline: Optional[float] = None,
     cancellation_check: Optional[Callable[[], Awaitable[bool]]] = None,
 ) -> Dict[str, Any]:
     """Execute a stable manifest prefix, resetting the selected URL per case."""
     planned = estimate_case_count(factors, include_action_order_permutations)
+    manifest_fingerprint = interaction_manifest_fingerprint(
+        target_url, factors, include_action_order_permutations
+    )
+    resume_state = resume_state or {}
+    saved_cursor = int(resume_state.get("next_case_index") or 0)
+    saved_executed = int(resume_state.get("executed_cases") or 0)
+    resume_matches = (
+        resume_state.get("manifest_fingerprint") == manifest_fingerprint
+        and saved_cursor == saved_executed
+        and 0 <= saved_cursor <= planned
+    )
+    resume_manifest_changed = bool(resume_state.get("manifest_fingerprint")) and not resume_matches
+    start_case_index = int(resume_state.get("next_case_index") or 0) if resume_matches else 0
+    start_case_index = min(max(0, start_case_index), planned)
     result: Dict[str, Any] = {
         "mode": "exhaustive_cartesian",
         "page_url": redact_url(target_url),
@@ -487,18 +544,21 @@ async def execute_interaction_matrix(
         ],
         "factors_discovered": len(factors),
         "planned_cases": planned,
-        "executed_cases": 0,
-        "passed_cases": 0,
-        "failed_cases": 0,
-        "blocked_cases": 0,
-        "pending_cases": planned,
+        "executed_cases": int(resume_state.get("executed_cases") or 0) if resume_matches else 0,
+        "passed_cases": int(resume_state.get("passed_cases") or 0) if resume_matches else 0,
+        "failed_cases": int(resume_state.get("failed_cases") or 0) if resume_matches else 0,
+        "blocked_cases": int(resume_state.get("blocked_cases") or 0) if resume_matches else 0,
+        "pending_cases": planned - (int(resume_state.get("executed_cases") or 0) if resume_matches else 0),
         "case_limit": max_generated_cases,
-        "limit_exceeded": planned > max_generated_cases,
+        "limit_exceeded": False,
         "action_order_permutations": include_action_order_permutations,
-        "complete": planned == 0,
+        "complete": planned == 0 or (resume_matches and start_case_index == planned),
         "interruption_reason": None,
-        "test_cases": [],
+        "test_cases": list(resume_state.get("test_cases") or []) if resume_matches else [],
         "dynamic_controls": [],
+        "manifest_fingerprint": manifest_fingerprint,
+        "next_case_index": start_case_index,
+        "resume_manifest_changed": resume_manifest_changed,
     }
     baseline_controls = baseline_controls or {}
     dynamic_control_keys = set()
@@ -512,15 +572,50 @@ async def execute_interaction_matrix(
         result["interruption_reason"] = "No eligible finite-domain controls were discovered on this page."
         return result
     value_domains = [factor["values"] for factor in factors]
-    # Permutation iterators are one-shot. Recreate the compact generator per value tuple.
-    for combination_index, selected_values in enumerate(itertools.product(*value_domains), start=1):
-        selected_by_factor = {factor["id"]: value for factor, value in zip(factors, selected_values)}
-        active_factor_indexes = tuple(
-            index for index, factor in enumerate(factors)
-            if selected_by_factor.get(factor["id"], {}).get("action") is not None
-        )
-        orders = itertools.permutations(active_factor_indexes) if include_action_order_permutations else [active_factor_indexes]
-        for order_index, order in enumerate(orders, start=1):
+    persisted_manifest = [
+        {
+            "id": factor["id"],
+            "label": factor["label"],
+            "kind": factor["kind"],
+            "values": [dict(value) for value in factor["values"]],
+        }
+        for factor in factors
+    ]
+
+    if checkpoint_callback and not resume_matches:
+        try:
+            await checkpoint_callback({
+                "initialize": True,
+                "manifest": persisted_manifest,
+                "manifest_fingerprint": manifest_fingerprint,
+                "next_case_index": 0,
+                "executed_cases": 0,
+                "passed_cases": 0,
+                "failed_cases": 0,
+                "blocked_cases": 0,
+            })
+        except Exception as error:
+            result["complete"] = False
+            result["interruption_reason"] = f"Could not initialize the interaction resume manifest: {redact_text(str(error))[:180]}"
+            return result
+
+    def iter_manifest_cases():
+        for selected_values in itertools.product(*value_domains):
+            selected_by_factor = {factor["id"]: value for factor, value in zip(factors, selected_values)}
+            active_factor_indexes = tuple(
+                index for index, factor in enumerate(factors)
+                if selected_by_factor.get(factor["id"], {}).get("action") is not None
+            )
+            orders = itertools.permutations(active_factor_indexes) if include_action_order_permutations else [active_factor_indexes]
+            for order in orders:
+                yield selected_values, tuple(order)
+
+    batch_executed_cases = 0
+    for case_index, (selected_values, order) in enumerate(
+        itertools.islice(iter_manifest_cases(), start_case_index, None),
+        start=start_case_index,
+    ):
+            selected_by_factor = {factor["id"]: value for factor, value in zip(factors, selected_values)}
             if cancellation_check and await cancellation_check():
                 raise asyncio.CancelledError("Scan cancelled during exhaustive interaction testing")
             if deadline is not None and time.monotonic() >= deadline:
@@ -532,7 +627,7 @@ async def execute_interaction_matrix(
                     result["interruption_reason"] = "Control domains changed during the suite and were not part of the initial manifest."
                 return result
 
-            case_ordinal = result["executed_cases"] + 1
+            case_ordinal = case_index + 1
             order_labels = [factors[index]["label"] for index in order]
             case_identity = {
                 "url": target_url,
@@ -656,7 +751,16 @@ async def execute_interaction_matrix(
                     if not same_selected_path:
                         break
 
-                case_status = "BLOCKED" if case_interrupted else "FAILED" if case_failed else "PASSED"
+                if case_interrupted:
+                    # The current case is not complete. Keep its index as the
+                    # cursor so the next batch can reset the route and retry it.
+                    result["next_case_index"] = case_index
+                    result["pending_cases"] = planned - result["executed_cases"]
+                    result["complete"] = False
+                    result["interruption_reason"] = blocked_reason or "The page interaction time budget ended during this case."
+                    return result
+
+                case_status = "FAILED" if case_failed else "PASSED"
 
                 try:
                     current_catalog = await FunctionalSpider.extract_interactive_catalog(page)
@@ -735,12 +839,31 @@ async def execute_interaction_matrix(
                 case_record["evidence_path"] = evidence_path
             result["test_cases"].append(case_record)
             result["executed_cases"] += 1
+            batch_executed_cases += 1
+            result["next_case_index"] = case_index + 1
             if case_status == "PASSED":
                 result["passed_cases"] += 1
             elif case_status == "BLOCKED":
                 result["blocked_cases"] += 1
             else:
                 result["failed_cases"] += 1
+
+            if checkpoint_callback:
+                try:
+                    await checkpoint_callback({
+                        "manifest_fingerprint": manifest_fingerprint,
+                        "next_case_index": case_index + 1,
+                        "executed_cases": result["executed_cases"],
+                        "passed_cases": result["passed_cases"],
+                        "failed_cases": result["failed_cases"],
+                        "blocked_cases": result["blocked_cases"],
+                        "case": case_record,
+                    })
+                except Exception as error:
+                    result["pending_cases"] = planned - result["executed_cases"]
+                    result["complete"] = False
+                    result["interruption_reason"] = f"Could not save the interaction resume checkpoint: {redact_text(str(error))[:180]}"
+                    return result
 
             if case_ordinal == 1 or case_ordinal % 10 == 0 or case_ordinal == planned:
                 await _emit_matrix_progress(run_id, case_ordinal, planned, case_status)
@@ -750,12 +873,13 @@ async def execute_interaction_matrix(
                 result["pending_cases"] = planned - result["executed_cases"]
                 return result
 
-            if result["executed_cases"] >= max_generated_cases and result["executed_cases"] < planned:
+            if batch_executed_cases >= max_generated_cases and result["executed_cases"] < planned:
                 result["pending_cases"] = planned - result["executed_cases"]
                 result["complete"] = False
                 result["limit_exceeded"] = True
                 result["interruption_reason"] = (
-                    f"The configured case limit of {max_generated_cases} was reached; "
+                    ("The control manifest changed; coverage restarted from case 1. " if resume_manifest_changed else "") +
+                    f"The configured batch limit of {max_generated_cases} was reached; "
                     f"{result['pending_cases']} cases remain pending. Raise the limit or reduce the selected domains."
                 )
                 return result
@@ -771,6 +895,7 @@ async def execute_interaction_matrix(
 
     result["pending_cases"] = planned - result["executed_cases"]
     result["complete"] = result["pending_cases"] == 0 and result["blocked_cases"] == 0
+    result["limit_exceeded"] = False
     if result["dynamic_controls"]:
         result["complete"] = False
         result["interruption_reason"] = (

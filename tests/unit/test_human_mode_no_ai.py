@@ -58,6 +58,26 @@ async def test_accessibility_without_ai_skips_vision_and_renormalizes_score():
 
 
 @pytest.mark.asyncio
+async def test_accessibility_defaults_to_text_llm_without_sending_screenshots_to_vision():
+    vision = AsyncMock(return_value=([], 100.0))
+    axe = AsyncMock(return_value=([], 100.0, {"axe_audit_completed": True}))
+    with patch.object(a11y_runner.AxeCoreScanner, "run_axe", axe), \
+         patch.object(a11y_runner.ResponsiveViewportScanner, "check_mobile_overflow",
+                      AsyncMock(return_value=([], 100.0))), \
+         patch.object(a11y_runner.ReadabilityScanner, "audit_elements",
+                      AsyncMock(return_value=([], 100.0))), \
+         patch.object(a11y_runner.UXVisionScanner, "audit_visual_design", vision):
+        result = await a11y_runner.AccessibilityScanner().scan(
+            _fake_page(), "https://example.com/", use_ai=True
+        )
+
+    vision.assert_not_called()
+    assert axe.await_args.kwargs["use_ai"] is True
+    assert result.metrics["ai_used"] is True
+    assert result.metrics["vision_review_disabled"] is True
+
+
+@pytest.mark.asyncio
 async def test_functional_without_ai_skips_form_suite_and_ai_journey_even_for_empty_pack():
     form_suite = AsyncMock(return_value=[])
     journey = AsyncMock()

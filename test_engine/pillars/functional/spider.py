@@ -54,6 +54,15 @@ class FunctionalSpider:
                     return (el.getAttribute('aria-label') || labelledBy || label || el.getAttribute('placeholder') ||
                         el.getAttribute('title') || el.innerText || buttonValue || '').trim().replace(/\s+/g, ' ').slice(0, 160);
                 };
+                const contextName = el => {
+                    const row = el.closest('tr, [role="row"], [role="listitem"], article, li');
+                    if (!row) return '';
+                    const heading = row.querySelector('h1, h2, h3, h4, h5, h6, [role="heading"]');
+                    const link = Array.from(row.querySelectorAll('a[href]'))
+                        .find(candidate => candidate !== el && candidate.innerText.trim());
+                    return (heading?.innerText || row.getAttribute('aria-label') || link?.innerText || row.getAttribute('data-testid') || '')
+                        .trim().replace(/\s+/g, ' ').slice(0, 100);
+                };
                 const cssPath = el => {
                     const parts = [];
                     let node = el;
@@ -132,6 +141,7 @@ class FunctionalSpider:
                         type,
                         role,
                         name,
+                        context_name: contextName(el),
                         placeholder: el.getAttribute('placeholder') || '',
                         has_popup: el.getAttribute('aria-haspopup') || null,
                         required: !!el.required || el.getAttribute('aria-required') === 'true',

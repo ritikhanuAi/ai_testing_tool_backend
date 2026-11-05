@@ -1,8 +1,11 @@
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import time
 import shutil
+import uuid
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -30,6 +33,178 @@ import app.apps.test_runs.models  # noqa
 import app.apps.reports.models  # noqa
 
 logger = logging.getLogger("workers.tasks.run_scan")
+
+
+def _matrix_checkpoint_keys(run_id: str, target_url: str) -> tuple[str, str]:
+    page_hash = hashlib.sha1(target_url.encode()).hexdigest()[:16]
+    base_key = f"matrix_resume:{run_id}:{page_hash}"
+    return f"{base_key}:state", f"{base_key}:cases"
+
+
+async def _load_matrix_checkpoint(run_id: str, target_url: str) -> Optional[Dict[str, Any]]:
+    """Load the persisted cursor and completed cases for one page matrix."""
+    import redis.asyncio as aioredis
+
+    state_key, cases_key = _matrix_checkpoint_keys(run_id, target_url)
+    client = aioredis.from_url(settings.REDIS_URL, socket_connect_timeout=2)
+    try:
+        raw_state = await client.hgetall(state_key)
+        if not raw_state:
+            return None
+        state = {
+            (key.decode() if isinstance(key, bytes) else key):
+            (value.decode() if isinstance(value, bytes) else value)
+            for key, value in raw_state.items()
+        }
+        raw_cases = await client.lrange(cases_key, 0, -1)
+        cases = []
+        for raw_case in raw_cases:
+            try:
+                cases.append(json.loads(raw_case.decode() if isinstance(raw_case, bytes) else raw_case))
+            except (TypeError, ValueError):
+                continue
+        executed = int(state.get("executed_cases", 0))
+        next_case_index = int(state.get("next_case_index", 0))
+        try:
+            manifest = json.loads(state.get("manifest") or "[]")
+        except ValueError:
+            manifest = []
+        if len(cases) != executed or next_case_index != executed or not isinstance(manifest, list) or not manifest:
+            logger.warning("Discarding inconsistent interaction checkpoint for %s", redact_url(target_url))
+            await client.delete(state_key, cases_key)
+            return None
+        return {
+            "manifest_fingerprint": state.get("manifest_fingerprint"),
+            "manifest": manifest,
+            "next_case_index": next_case_index,
+            "executed_cases": executed,
+            "passed_cases": int(state.get("passed_cases", 0)),
+            "failed_cases": int(state.get("failed_cases", 0)),
+            "blocked_cases": int(state.get("blocked_cases", 0)),
+            "test_cases": cases,
+        }
+    finally:
+        await client.aclose()
+
+
+async def _save_matrix_checkpoint(
+    run_id: str,
+    target_url: str,
+    checkpoint: Dict[str, Any],
+) -> None:
+    """Atomically append one case and advance the page cursor in Redis."""
+    import redis.asyncio as aioredis
+
+    state_key, cases_key = _matrix_checkpoint_keys(run_id, target_url)
+    client = aioredis.from_url(settings.REDIS_URL, socket_connect_timeout=2)
+    try:
+        save_script = """
+            local fingerprint = redis.call('HGET', KEYS[1], 'manifest_fingerprint')
+            if fingerprint ~= ARGV[1] then
+                redis.call('DEL', KEYS[1], KEYS[2])
+            end
+            if ARGV[9] == '1' then
+                redis.call('HSET', KEYS[1],
+                    'manifest_fingerprint', ARGV[1],
+                    'next_case_index', '0',
+                    'executed_cases', '0',
+                    'passed_cases', '0',
+                    'failed_cases', '0',
+                    'blocked_cases', '0',
+                    'manifest', ARGV[10])
+                redis.call('EXPIRE', KEYS[1], ARGV[8])
+                redis.call('EXPIRE', KEYS[2], ARGV[8])
+                return 1
+            end
+            local cursor = tonumber(redis.call('HGET', KEYS[1], 'next_case_index') or '0')
+            local next_cursor = tonumber(ARGV[2])
+            if next_cursor <= cursor then return 0 end
+            if next_cursor ~= cursor + 1 then
+                return redis.error_reply('interaction checkpoint cursor is not sequential')
+            end
+            redis.call('RPUSH', KEYS[2], ARGV[7])
+            redis.call('HSET', KEYS[1],
+                'manifest_fingerprint', ARGV[1],
+                'next_case_index', ARGV[2],
+                'executed_cases', ARGV[3],
+                'passed_cases', ARGV[4],
+                'failed_cases', ARGV[5],
+                'blocked_cases', ARGV[6])
+            if ARGV[10] ~= '' then redis.call('HSET', KEYS[1], 'manifest', ARGV[10]) end
+            redis.call('EXPIRE', KEYS[1], ARGV[8])
+            redis.call('EXPIRE', KEYS[2], ARGV[8])
+            return 1
+        """
+        await client.eval(
+            save_script,
+            2,
+            state_key,
+            cases_key,
+            checkpoint["manifest_fingerprint"],
+            checkpoint["next_case_index"],
+            checkpoint["executed_cases"],
+            checkpoint["passed_cases"],
+            checkpoint["failed_cases"],
+            checkpoint["blocked_cases"],
+            json.dumps(checkpoint.get("case"), ensure_ascii=False) if checkpoint.get("case") is not None else "",
+            30 * 24 * 60 * 60,
+            "1" if checkpoint.get("initialize") else "0",
+            json.dumps(checkpoint.get("manifest"), ensure_ascii=False) if checkpoint.get("manifest") is not None else "",
+        )
+    finally:
+        await client.aclose()
+
+
+async def _clear_matrix_checkpoints(run_id: str) -> None:
+    import redis.asyncio as aioredis
+
+    client = aioredis.from_url(settings.REDIS_URL, socket_connect_timeout=2)
+    try:
+        keys = [key async for key in client.scan_iter(match=f"matrix_resume:{run_id}:*")]
+        if keys:
+            await client.delete(*keys)
+    finally:
+        await client.aclose()
+
+
+def _matrix_batch_can_resume(matrix_pages: List[Dict[str, Any]]) -> bool:
+    incomplete = [page for page in matrix_pages if not page.get("complete")]
+    if not incomplete:
+        return False
+    resumable_reasons = (
+        "configured batch limit",
+        "page interaction time budget ended",
+    )
+    for page in incomplete:
+        reason = str(page.get("interruption_reason") or "").lower()
+        if (
+            int(page.get("pending_cases") or 0) <= 0
+            or not any(marker in reason for marker in resumable_reasons)
+            or not page.get("discovery_complete", True)
+            or page.get("discovery_errors")
+            or page.get("unsupported_controls")
+            or page.get("dynamic_controls")
+            or page.get("undiscovered_custom_dropdowns")
+            or page.get("resume_manifest_changed")
+        ):
+            return False
+    return True
+
+
+async def _mark_scan_continuing(run_id: str, message: str) -> None:
+    from app.common.progress import ScanProgressTracker
+    from app.core.database import AsyncSessionLocal
+    from app.apps.test_runs.models import TestRun
+    from sqlalchemy import select
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(TestRun).where(TestRun.id == run_id))
+        run = result.scalar_one_or_none()
+        if run:
+            run.status = RunStatus.RUNNING
+            run.error_message = message
+            await db.commit()
+    await ScanProgressTracker.log(run_id, "FUNCTIONAL", message, 30, level="INFO")
 
 async def _persist_scan_start(run_id: str) -> None:
     """Mark test run as running in the database."""
@@ -70,8 +245,7 @@ async def _persist_scan_success(
             if run:
                 run.status = RunStatus.COMPLETED
                 run.completed_at = datetime.now(timezone.utc)
-                if note:
-                    run.error_message = note
+                run.error_message = note
                 # Denormalize pillar scores onto the run for fast list filtering
                 pillar_results = report_data.get("pillar_results", {})
                 run.functional_score = (pillar_results.get("functional") or {}).get("score")
@@ -410,6 +584,7 @@ async def _async_execute_scan(
                 18,
             )
             if exhaustive_interactions:
+                matrix_resume_state = await _load_matrix_checkpoint(run_id, page_url)
                 matrix = await functional_scanner.test_crawled_page_combinations(
                     page=browser_page,
                     target_url=page_url,
@@ -417,6 +592,8 @@ async def _async_execute_scan(
                     text_values=list(profile.get("interaction_test_values") or []),
                     max_generated_cases=int(profile.get("max_generated_cases") or 1000),
                     include_action_order_permutations=bool(profile.get("include_action_order_permutations", False)),
+                    resume_state=matrix_resume_state,
+                    checkpoint_callback=lambda checkpoint: _save_matrix_checkpoint(run_id, page_url, checkpoint),
                     deadline=interaction_deadline,
                     cancellation_check=lambda: _is_cancelled(run_id),
                 )
@@ -465,6 +642,16 @@ async def _async_execute_scan(
         # Check cancellation before initial run
         if await _is_cancelled(run_id):
             raise asyncio.CancelledError("Scan cancelled before start")
+
+        if exhaustive_interactions and use_ai and _matrix_batch_can_resume(page_combinatorial_results):
+            total_executed = sum(int(item.get("executed_cases") or 0) for item in page_combinatorial_results)
+            total_planned = sum(int(item.get("planned_cases") or 0) for item in page_combinatorial_results)
+            continuation_note = (
+                f"Interaction batch finished ({total_executed}/{total_planned} planned cases so far). "
+                "The scan will resume from its saved page cursors."
+            )
+            await _mark_scan_continuing(run_id, continuation_note)
+            return {"status": "RESUME_REQUIRED", "run_id": run_id}
 
         # Two exclusive modes: a human-written test pack means NO AI anywhere in the scan
         # (no AI test writing, failure explanations, accessibility fixes, or screenshot review).
@@ -680,6 +867,8 @@ async def _async_execute_scan(
             report_dict["incomplete_reason"] = coverage_note
             report_dict["passed"] = False
         await _persist_scan_success(run_id, report_dict, artifacts=artifacts, note=coverage_note)
+        if coverage_complete or not _matrix_batch_can_resume(func_result.metrics.get("combinatorial_pages") or []):
+            await _clear_matrix_checkpoints(run_id)
         await ScanProgressTracker.log(
             run_id, "COMPLETED",
             coverage_note or f"Audit finished successfully! Overall Score: {unified_report.overall_score}/100, Grade: {unified_report.grade}",
@@ -694,6 +883,7 @@ async def _async_execute_scan(
             raise
         logger.info(f"Scan run {run_id} aborted due to cancellation.")
         await _persist_scan_failure(run_id, "Scan cancelled by user request", is_cancelled=True)
+        await _clear_matrix_checkpoints(run_id)
         return {"status": "CANCELLED", "run_id": run_id}
     except Exception as exc:
         await _persist_scan_failure(run_id, str(exc), is_cancelled=False)
@@ -755,6 +945,23 @@ async def _execute_with_timeout(
             logger.error(f"Error persisting scan failure for {run_id}: {e}")
         return {"status": "FAILED", "run_id": run_id, "error": "scan_timeout"}
 
+
+def _persist_worker_failure(run_id: str, message: str) -> None:
+    async def persist_in_fresh_loop():
+        try:
+            from app.core.database import engine
+            await engine.dispose()
+        except Exception:
+            pass
+        await _persist_scan_failure(run_id, message)
+
+    asyncio.run(persist_in_fresh_loop())
+
+
+async def _persist_cancelled_and_clear_checkpoints(run_id: str) -> None:
+    await _persist_scan_failure(run_id, "Scan cancelled by user request", is_cancelled=True)
+    await _clear_matrix_checkpoints(run_id)
+
 @celery_app.task(bind=True, name="workers.tasks.run_scan.execute_website_scan")
 def execute_website_scan(
     self,
@@ -766,9 +973,39 @@ def execute_website_scan(
     credentials: Optional[Dict[str, Any]] = None,
     options: Optional[Dict[str, Any]] = None,
     scan_profile: Optional[Dict[str, Any]] = None,
+    continuation_task_id: Optional[str] = None,
     **kwargs: Any,
 ):
     """Celery task entrypoint."""
+    if continuation_task_id and continuation_task_id != self.request.id:
+        logger.info("Ignoring stale interaction continuation task %s", self.request.id)
+        return {"status": "DUPLICATE_CONTINUATION_IGNORED", "run_id": run_id}
+    if continuation_task_id:
+        try:
+            import redis
+            client = redis.Redis.from_url(settings.REDIS_URL, socket_connect_timeout=2)
+            current_lock = client.get(f"matrix_resume:{run_id}:continuation")
+            client.close()
+            current_lock = current_lock.decode() if isinstance(current_lock, bytes) else current_lock
+            if current_lock != continuation_task_id:
+                logger.info("Ignoring superseded interaction continuation %s", self.request.id)
+                return {"status": "DUPLICATE_CONTINUATION_IGNORED", "run_id": run_id}
+        except Exception:
+            logger.exception("Could not validate interaction continuation for run %s", run_id)
+            _persist_worker_failure(run_id, "Could not validate the interaction continuation")
+            return {"status": "FAILED", "run_id": run_id, "error": "continuation_validation_failed"}
+    else:
+        try:
+            import redis
+            client = redis.Redis.from_url(settings.REDIS_URL, socket_connect_timeout=2)
+            current_lock = client.get(f"matrix_resume:{run_id}:continuation")
+            client.close()
+            if current_lock:
+                logger.info("Ignoring duplicate root task while run %s already has a continuation", run_id)
+                return {"status": "CONTINUING", "run_id": run_id}
+        except Exception:
+            # The matrix checkpoint path will report Redis failures explicitly.
+            pass
     logger.info(f"Starting automated scan task for run {run_id} on {redact_url(target_url)}")
 
     # Dispose the async engine's connection pool before creating a new event loop.
@@ -782,11 +1019,15 @@ def execute_website_scan(
     except Exception as _e:
         logger.debug(f"Engine dispose skipped: {_e}")
 
+    if asyncio.run(_is_cancelled(run_id)):
+        asyncio.run(_persist_cancelled_and_clear_checkpoints(run_id))
+        return {"status": "CANCELLED", "run_id": run_id}
+
     effective_profile = {**(options or {}), **(scan_profile or {})}
     # Allow at least 300s (5 minutes) so that crawler + multi-step AI ReAct journey can complete
     raw_timeout = int(effective_profile.get("timeout_seconds") or 300)
     timeout_seconds = max(300, raw_timeout)
-    return asyncio.run(_execute_with_timeout(
+    result = asyncio.run(_execute_with_timeout(
         run_id=run_id,
         target_url=target_url,
         allowed_domains=allowed_domains,
@@ -797,3 +1038,68 @@ def execute_website_scan(
         scan_profile=scan_profile,
         timeout_seconds=timeout_seconds,
     ))
+    if result.get("status") == "RESUME_REQUIRED":
+        continuation_id = str(uuid.uuid4())
+        continuation_key = f"matrix_resume:{run_id}:continuation"
+        client = None
+        try:
+            import redis
+            client = redis.Redis.from_url(settings.REDIS_URL, socket_connect_timeout=2)
+            expected_lock = self.request.id if continuation_task_id else "__no_lock__"
+            reserve_script = """
+                local current = redis.call('GET', KEYS[1])
+                if ARGV[1] == '__no_lock__' then
+                    if current then return 0 end
+                elseif current ~= ARGV[1] then
+                    return 0
+                end
+                redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+                return 1
+            """
+            reserved = client.eval(
+                reserve_script, 1, continuation_key, expected_lock,
+                continuation_id, 30 * 24 * 60 * 60,
+            )
+            if not reserved:
+                client.close()
+                logger.info("Another continuation is already queued for run %s", run_id)
+                return {"status": "CONTINUING", "run_id": run_id}
+        except Exception:
+            logger.exception("Could not reserve an interaction continuation for run %s", run_id)
+            if client:
+                client.close()
+            _persist_worker_failure(run_id, "Could not queue the next interaction matrix batch")
+            return {"status": "FAILED", "run_id": run_id, "error": "continuation_queue_failed"}
+
+        try:
+            self.apply_async(
+                task_id=continuation_id,
+                kwargs={
+                    "run_id": run_id,
+                    "target_url": target_url,
+                    "allowed_domains": allowed_domains,
+                    "test_pack_yaml": test_pack_yaml,
+                    "cookies": cookies,
+                    "credentials": credentials,
+                    "options": options,
+                    "scan_profile": scan_profile,
+                    "continuation_task_id": continuation_id,
+                },
+                countdown=1,
+            )
+        except Exception:
+            try:
+                client.delete(continuation_key)
+            finally:
+                client.close()
+            logger.exception("Could not enqueue interaction continuation for run %s", run_id)
+            _persist_worker_failure(run_id, "Could not queue the next interaction matrix batch")
+            return {"status": "FAILED", "run_id": run_id, "error": "continuation_queue_failed"}
+        client.close()
+        logger.info(
+            "Queued interaction-matrix continuation for run %s as task %s",
+            run_id,
+            continuation_id,
+        )
+        return {"status": "CONTINUING", "run_id": run_id, "continuation_task_id": continuation_id}
+    return result

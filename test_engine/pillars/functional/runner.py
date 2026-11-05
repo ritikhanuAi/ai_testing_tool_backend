@@ -718,6 +718,8 @@ class FunctionalScanner(BasePillarScanner):
         text_values: Optional[List[str]] = None,
         max_generated_cases: int = 1000,
         include_action_order_permutations: bool = False,
+        resume_state: Optional[Dict[str, Any]] = None,
+        checkpoint_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
         deadline: Optional[float] = None,
         cancellation_check: Optional[Callable[[], Awaitable[bool]]] = None,
     ) -> Dict[str, Any]:
@@ -746,7 +748,7 @@ class FunctionalScanner(BasePillarScanner):
                 "blocked_cases": 0,
                 "pending_cases": planned,
                 "case_limit": max_generated_cases,
-                "limit_exceeded": planned > max_generated_cases,
+                "limit_exceeded": False,
                 "action_order_permutations": include_action_order_permutations,
                 "complete": False,
                 "interruption_reason": discovery["discovery_errors"][0],
@@ -762,6 +764,8 @@ class FunctionalScanner(BasePillarScanner):
                 max_generated_cases=max_generated_cases,
                 include_action_order_permutations=include_action_order_permutations,
                 baseline_controls=discovery.get("control_snapshot"),
+                resume_state=resume_state,
+                checkpoint_callback=checkpoint_callback,
                 deadline=deadline,
                 cancellation_check=cancellation_check,
             )

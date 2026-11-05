@@ -47,7 +47,12 @@ class AdvancedExecutionOptions(BaseModel):
         description="Finite values used for discovered text and search controls; an empty value is always included.",
     )
     include_action_order_permutations: bool = False
-    max_generated_cases: int = Field(default=1000, ge=1, le=100000)
+    max_generated_cases: int = Field(
+        default=1000,
+        ge=1,
+        le=100000,
+        description="Maximum interaction cases in one page batch; resumable batches continue until coverage finishes.",
+    )
 
     # AI Intelligence Options
     use_ai_generation: bool = True      # Use LLM to author tests dynamically
