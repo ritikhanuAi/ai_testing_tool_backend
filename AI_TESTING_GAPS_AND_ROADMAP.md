@@ -2,7 +2,7 @@
 
 **Document:** AI Testing Engine Assessment & Roadmap  
 **Target Repository:** `ai_testing_tool_backend`  
-**AI Stack:** Remote STPI Qwen-27B VLM (OpenAI-Compatible) + Offline Ollama Fallback + Playwright  
+**AI Stack:** Text LLM (remote OpenAI-compatible provider or local Ollama) + Playwright; VLM screenshot review is deferred
 **Date:** October 2026  
 **Status:** Approved Architecture Blueprint  
 
@@ -17,7 +17,7 @@
 | **Test Suite Coverage** | ⭐⭐ (2/5) | Hardcoded to return only 1 test case. | Multi-scenario test suite (3–8 diverse journeys). |
 | **Locator Reliability** | ⭐ (1/5) | AI hallucinates CSS selectors not guaranteed to exist. | Verified DOM locators, fuzzy matching, self-healing. |
 | **SPA & Framework Support** | ⭐⭐ (2/5) | Blind to `<div>` buttons, dialogs, modern React/Vue inputs. | Framework-agnostic interactive widget recognition. |
-| **Multimodal Vision (VLM)** | ⭐⭐⭐ (3/5) | Basic desktop screenshot UX review. | Mobile/desktop visual regression + bug bounding boxes. |
+| **Multimodal Vision (VLM)** | Deferred | Existing screenshot-review code is retained but disabled in scans. | Out of scope for the current LLM-only phase. |
 | **Agent Autonomy** | ⭐⭐ (2/5) | Static pre-planned scripts (open ➔ type ➔ click). | Dynamic ReAct loop (Observe ➔ Act ➔ Observe). |
 
 ---
@@ -87,13 +87,8 @@
 
 ---
 
-### 🔴 Gap 6: Multimodal Vision (VLM) is Underutilized
-* **Location in Code:** `test_engine/pillars/accessibility/ux_vision_scanner.py`
-* **The Problem:** The vision model is currently only fed a single static desktop screenshot to find generic text overlap.
-* **Missed Opportunities:**
-  * **Visual Regression:** No comparison between before-click and after-click states.
-  * **Responsive Visual Mismatch:** Does not inspect tablet vs. mobile layouts side-by-side.
-  * **Visual Coordinate Highlighting:** Does not output pixel bounding boxes `[ymin, xmin, ymax, xmax]` to highlight bugs on the screenshot in the frontend UI.
+### ⏸ Deferred: Multimodal Vision (VLM)
+Screenshot-based visual review, visual regression, responsive visual comparison, and bounding-box overlays are outside the current scope. The existing VLM implementation remains in the codebase but scan execution does not send screenshots to it. Current AI work uses text prompts and DOM/accessibility data through the configured LLM; text-based accessibility fix suggestions remain enabled.
 
 ---
 
@@ -115,7 +110,7 @@
 │ 2. Multi-Scenario Matrix       │ Generates 3-5 distinct test journeys  │
 │ 3. Self-Healing Action Runner │ Recovers from broken selectors live    │
 │ 4. ReAct Autonomous Agent      │ Observes DOM dynamically step-by-step │
-│ 5. Visual Bug Bounding Boxes   │ VLM highlights visual defects in UI   │
+│ 5. Visual Bug Bounding Boxes   │ Deferred; not in current LLM-only phase│
 │ 6. Natural Language Intent     │ "Test checkout flow with promo code"  │
 │ 7. Adversarial QA Testing      │ Injects SQLi, XSS, and boundary values│
 └────────────────────────────────┴───────────────────────────────────────┘
@@ -153,8 +148,8 @@ When `ActionRunner` cannot find an element within 5 seconds:
 
 ---
 
-### 🌟 Add-On 4: Multimodal Vision Bounding Boxes
-Upgrade [UXVisionEvaluator](file:///home/hanuai/Documents/Office%20work%20projects/ai_testing_tool/ai_testing_tool_backend/ai_engine/prompts/ux_vision_evaluator.py) to ask Qwen-27B Vision for normalized bounding box coordinates:
+### ⏸ Deferred Add-On 4: Multimodal Vision Bounding Boxes
+Do not implement this during the current LLM-only phase. If prioritized later, upgrade the UX vision evaluator to request normalized bounding box coordinates:
 ```json
 {
   "title": "Text overflows container",
@@ -199,6 +194,7 @@ The following work was implemented for the requested module-focused testing work
 - [x] Report planned, executed, passed, failed, blocked, and pending matrix cases, plus undiscovered or changing control domains.
 - [x] Group repeated same-name row buttons as alternatives, and only permute actions selected in a case.
 - [x] Execute the deterministic case prefix up to the configured per-page limit instead of aborting the page with zero cases.
+- [x] Disable screenshot-based VLM review in scan execution while retaining text-based LLM testing and fix suggestions.
 
 Remaining work before claiming that every planned case will eventually execute:
 
@@ -216,12 +212,14 @@ The current implementation still marks coverage incomplete when the configured c
 ### 📍 Sprint 2 (Intelligence & Robustness - P1)
 - [ ] **Task 2.1:** Implement Self-Healing Selector recovery in `ActionRunner`.
 - [ ] **Task 2.2:** Upgrade assertions to check actual UI state transitions and error messages.
-- [ ] **Task 2.3:** Add multi-viewport visual audits (Mobile 375px + Desktop 1280px).
 
 ### 📍 Sprint 3 (Advanced Agent Autonomy - P2)
 - [ ] **Task 3.1:** Implement full ReAct step-by-step observation agent.
-- [ ] **Task 3.2:** Add visual bug bounding box overlays on screenshots.
 - [ ] **Task 3.3:** Enable natural language goal-driven exploratory testing.
+
+### Deferred Backlog (after the LLM-only phase)
+- [ ] Re-enable and improve screenshot-based VLM UX review.
+- [ ] Add desktop/mobile visual comparison and bug bounding-box overlays.
 
 ---
 

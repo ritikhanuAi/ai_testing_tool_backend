@@ -13,7 +13,7 @@ class AccessibilityScanner(BasePillarScanner):
     """
     Comprehensive UI/UX & Accessibility Pillar:
     Unites automated WCAG 2.1 AA audits (axe-core) with AI generative code fixes,
-    responsive viewport testing, and multimodal VLM visual design review.
+    and responsive viewport testing. Screenshot-based VLM review is opt-in.
     """
 
     @property
@@ -28,10 +28,14 @@ class AccessibilityScanner(BasePillarScanner):
         comparison_paths: Optional[List[str]] = None,
         crawl_result: Optional[CrawlResult] = None,
         use_ai: bool = True,
+        use_visual_ai: bool = False,
         **kwargs
     ) -> PillarScanResult:
-        """Run accessibility checks. ``use_ai=False`` (human test pack mode) skips the AI
-        screenshot review and AI fix suggestions; only deterministic checks run."""
+        """Run deterministic accessibility checks and optional text/visual AI features.
+
+        ``use_ai`` controls text-based code-fix suggestions. ``use_visual_ai`` separately
+        controls screenshot submission to a vision model and is disabled by default.
+        """
         start_time = time.time()
         findings: List[PillarFinding] = []
 
@@ -93,8 +97,8 @@ class AccessibilityScanner(BasePillarScanner):
         read_score = sum(read_scores) / len(read_scores) if read_scores else 0.0
 
         # Vision review remains on the start page; deterministic checks cover each crawled route.
-        # It is an AI feature, so it is turned off (not failed) when use_ai is False.
-        vision_review_disabled = not use_ai
+        # Screenshot review is independently opt-in; text LLM features remain available.
+        vision_review_disabled = not use_visual_ai
         vision_score = 0.0
         vision_review_completed = False
         if not vision_review_disabled:
@@ -117,7 +121,7 @@ class AccessibilityScanner(BasePillarScanner):
         }
 
         # Composite Pillar Score (Weighted: 50% WCAG, 20% Mobile, 15% Readability, 15% Vision UX).
-        # When the AI review is turned off, the other three parts are renormalized (÷ 0.85)
+        # When screenshot review is off, the other three parts are renormalized (÷ 0.85)
         # so the score is not penalized for a check that intentionally did not run.
         if vision_review_disabled:
             composite_score = (
@@ -187,12 +191,12 @@ class AccessibilityScanner(BasePillarScanner):
                 "pages_audited": pages_audited,
                 "crawl_pages_not_audited": crawl_pages_not_audited,
                 "page_audit_errors": [redact_url(error) for error in accessibility_page_errors],
-                "vision_review_scope": "turned off (human test pack mode, no AI)" if vision_review_disabled else "starting page only",
+                "vision_review_scope": "disabled by scan profile" if vision_review_disabled else "starting page only",
                 "score_unavailable": pages_audited == 0,
                 "score_note": (
                     "No axe-core audit completed; 0 is not a measured zero-violation result."
                     if pages_audited == 0 else
-                    "Human test pack mode: AI screenshot review was turned off; the score uses WCAG, mobile and readability checks only."
+                    "Screenshot review is disabled; the score uses WCAG, mobile and readability checks only. Text-based LLM fixes may still be enabled."
                     if vision_review_disabled else (
                         "The configured remote VLM review was unavailable; its 15% score component is zero."
                         if not vision_review_completed else "Page scores average successful axe-core audits in this crawl."

@@ -590,9 +590,9 @@ async def _async_execute_scan(
         if await _is_cancelled(run_id):
             raise asyncio.CancelledError("Scan cancelled after performance pillar")
 
-        # 4. Accessibility & UX Pillar (Axe-core WCAG + AI Code Fixes + Mobile + Multimodal Vision)
+        # 4. Accessibility & UX Pillar (Axe-core WCAG + optional text fixes + responsive checks)
         if profile["check_accessibility"]:
-            await ScanProgressTracker.log(run_id, "ACCESSIBILITY", "Starting Accessibility Pillar: Running Axe-core WCAG rules, responsive audits & AI visual review...", 85)
+            await ScanProgressTracker.log(run_id, "ACCESSIBILITY", "Starting Accessibility Pillar: Running Axe-core WCAG rules, text-based LLM fixes & responsive audits...", 85)
             if page.is_closed():
                 page = await context.new_page()
             await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
@@ -602,6 +602,7 @@ async def _async_execute_scan(
                 run_id=run_id,
                 comparison_paths=func_result.metrics.get("visual_comparison_paths", []),
                 use_ai=use_ai,
+                use_visual_ai=False,
                 crawl_result=crawl_result,
             )
             await ScanProgressTracker.log(run_id, "ACCESSIBILITY", f"Accessibility pillar completed (Score: {a11y_result.score}/100, Findings: {len(a11y_result.findings)})", 95)
