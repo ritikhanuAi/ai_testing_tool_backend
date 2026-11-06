@@ -34,6 +34,7 @@ class AdvancedExecutionOptions(BaseModel):
 
     # Safety Guardrails & Rate Limits
     allow_state_changing: bool = False  # False = Read-only mode (blocks destructive actions)
+    allow_private_hosts: bool = False   # True = allow staging/internal URLs (bypasses SSRF protection)
     rate_limit_rps: int = 10            # Max HTTP requests per second to target
     timeout_seconds: int = 300          # Total scan timeout
     max_crawl_depth: int = 2            # Exploration depth

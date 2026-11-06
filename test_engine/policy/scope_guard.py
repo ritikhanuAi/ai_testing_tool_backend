@@ -17,9 +17,11 @@ class ScopeGuard:
         allow_common_cdns: bool = True,
         max_requests_per_second: int = 10,
         target_url: str = "",
+        allow_private_hosts: bool = False,
     ):
         self.allowed_hostnames = {h.lower().strip().rstrip(".") for h in allowed_hostnames}
         self.allow_common_cdns = allow_common_cdns
+        self.allow_private_hosts = allow_private_hosts
         self.request_interval = 1.0 / max(1, max_requests_per_second)
         try:
             target = urlparse(target_url)
@@ -93,13 +95,16 @@ class ScopeGuard:
                 parsed.scheme.lower() == self.target_scheme and port == self.target_port
             )
 
+            host_ok = (
+                self._is_allowed_host(hostname)
+                and (self.allow_private_hosts or await self._host_resolves_publicly(hostname))
+            )
             if (
                 parsed.scheme.lower() in {"http", "https"}
                 and not parsed.username
                 and not parsed.password
                 and allowed_port
-                and self._is_allowed_host(hostname)
-                and await self._host_resolves_publicly(hostname)
+                and host_ok
             ):
                 await self._throttle_request()
                 await route.continue_()

@@ -1,3 +1,4 @@
+import json
 import time
 from playwright.async_api import Page
 from test_engine.schema.actions import ActionStep, ActionType
@@ -5,8 +6,49 @@ from test_engine.browser.locators import resolve_locator
 from test_engine.browser.evidence import EvidenceCollector
 from typing import Dict, Any
 import logging
+import mimetypes
 
 logger = logging.getLogger("test_engine.browser.action_runner")
+
+
+async def _find_custom_option(page: Page, trigger, option_name: str):
+    """Find a visible custom-menu item, preferring the popup owned by its trigger."""
+    scopes = []
+    controls = (await trigger.get_attribute("aria-controls") or "").split()
+    for popup_id in controls:
+        scopes.append(page.locator(f"[id={json.dumps(popup_id)}]"))
+
+    visible_popups = page.locator(
+        '[role="listbox"]:visible, [role="menu"]:visible, [role="option"]:visible, '
+        '[role="menuitem"]:visible, [data-radix-popper-content-wrapper]:visible, [data-state="open"]:visible'
+    )
+    for index in range(await visible_popups.count()):
+        scopes.append(visible_popups.nth(index))
+
+    expanded = (await trigger.get_attribute("aria-expanded") or "").lower() == "true"
+    popup_open = expanded or await visible_popups.count() > 0
+    for scope in scopes:
+        try:
+            popup_open = popup_open or await scope.is_visible()
+        except Exception:
+            continue
+    # Some custom widgets render an open portal without ARIA roles. Use a page-wide
+    # text fallback only after verifying that the trigger actually exposed a popup.
+    if popup_open:
+        scopes.append(page.locator("body"))
+    for scope in scopes:
+        for role in ("option", "menuitem", "button"):
+            candidate = scope.get_by_role(role, name=option_name, exact=True)
+            for index in range(await candidate.count()):
+                item = candidate.nth(index)
+                if await item.is_visible():
+                    return item
+        text_matches = scope.get_by_text(option_name, exact=True)
+        for index in range(await text_matches.count()):
+            item = text_matches.nth(index)
+            if await item.is_visible():
+                return item
+    return None
 
 class ActionRunner:
     """Executes discrete browser actions via Playwright and tracks timing and outcomes."""
@@ -46,6 +88,28 @@ class ActionRunner:
                     "details": f"Typed text into '{step.target}'"
                 }
 
+            elif step.action == ActionType.UPLOAD_FILE:
+                raw = str(step.value or "test_upload.txt")
+                try:
+                    payload = json.loads(raw)
+                    filename = payload.get("name", "test_upload.txt")
+                    mime_type = payload.get("mimeType") or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+                    content = payload.get("content", f"Test upload: {filename}")
+                except (json.JSONDecodeError, ValueError):
+                    filename = raw
+                    mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+                    content = f"Test upload: {filename}"
+                await locator.set_input_files(
+                    {"name": filename, "mimeType": mime_type, "buffer": content.encode()},
+                    timeout=timeout,
+                )
+                return {
+                    "action": step.action.value,
+                    "target": step.target,
+                    "status": "PASSED",
+                    "details": f"Uploaded file '{filename}' ({mime_type})",
+                }
+
             elif step.action == ActionType.SELECT_OPTION:
                 tag_name = await locator.evaluate("element => element.tagName.toLowerCase()")
                 if tag_name == "select":
@@ -58,10 +122,23 @@ class ActionRunner:
                             await locator.select_option(value=str(step.value), timeout=timeout)
                 else:
                     await locator.click(timeout=timeout)
-                    option = page.get_by_role("option", name=str(step.value), exact=True)
-                    if await option.count() == 0:
-                        option = page.get_by_role("menuitem", name=str(step.value), exact=True)
-                    await option.wait_for(state="visible", timeout=timeout)
+                    option_name = str(step.value)
+                    option = await _find_custom_option(page, locator, option_name)
+                    if option is None:
+                        # Allow the UI a short render window for portals that mount
+                        # their menu asynchronously after the trigger click.
+                        try:
+                            await page.get_by_text(option_name, exact=True).first.wait_for(
+                                state="visible", timeout=min(timeout, 2000)
+                            )
+                        except Exception:
+                            pass
+                        option = await _find_custom_option(page, locator, option_name)
+                    if option is None:
+                        raise TimeoutError(
+                            f"Could not select {option_name!r}: no visible matching option appeared after clicking the dropdown. "
+                            "The control may not have opened, may use unsupported markup, or its options may have changed."
+                        )
                     await option.click(timeout=timeout)
                 return {
                     "action": step.action.value,

@@ -9,6 +9,7 @@ class ActionType(str, Enum):
     SET_CHECKED = "set_checked"
     SET_RANGE = "set_range"
     TYPE_TEXT = "type_text"
+    UPLOAD_FILE = "upload_file"
     WAIT = "wait"
     DOWNLOAD = "download"
     SCROLL = "scroll"
@@ -17,7 +18,7 @@ class ActionType(str, Enum):
 
 class ActionStep(BaseModel):
     action: ActionType
-    target: Optional[str] = Field(default=None, description="CSS selector or Playwright role locator (e.g. role=combobox[name='Region'])")
+    target: Optional[str] = Field(default=None, description="CSS selector, XPath (e.g. //input[@id='email']), or role locator (e.g. role=combobox[name='Region'])")
     fallback_role: Optional[str] = Field(default=None, description="Accessible role used to recover a stale selector")
     fallback_name: Optional[str] = Field(default=None, description="Accessible name used with fallback_role")
     value: Optional[str] = Field(default=None, description="Input text, option value, or URL")

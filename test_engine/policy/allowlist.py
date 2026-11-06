@@ -18,10 +18,26 @@ class TargetAllowlistValidator:
     ]
 
     @classmethod
-    def assert_public_host(cls, hostname: str) -> Tuple[bool, str]:
-        """Resolve hostname to IP addresses and assert none resolve to private or cloud metadata IPs."""
+    def assert_public_host(cls, hostname: str, skip_private_check: bool = False) -> Tuple[bool, str]:
+        """Resolve hostname to IP addresses and assert none resolve to private or cloud metadata IPs.
+
+        Set skip_private_check=True to allow staging/internal hosts (bypasses IP range enforcement).
+        """
         if not hostname:
             return False, "Empty hostname"
+
+        if skip_private_check:
+            # Still validate the hostname is non-empty and resolvable, but skip IP range checks.
+            try:
+                ipaddress.ip_address(hostname)
+            except ValueError:
+                try:
+                    socket.getaddrinfo(hostname, None)
+                except socket.gaierror:
+                    return False, f"Hostname '{hostname}' could not be resolved"
+                except Exception as e:
+                    return False, f"DNS resolution failed: {str(e)}"
+            return True, "Private host check bypassed for internal/staging target"
 
         # Direct check for localhost
         if hostname.lower().rstrip(".") in ("localhost", "localhost.localdomain"):

@@ -25,7 +25,8 @@ async def dispatch_quick_scan(db: AsyncSession, request_data: QuickScanRequest) 
         raise ScopeViolationException("Invalid target URL; missing hostname")
 
     # 1. Enforce SSRF & Private Host Guardrails
-    TargetAllowlistValidator.assert_public_host(hostname)
+    allow_private = bool(request_data.options and request_data.options.allow_private_hosts)
+    TargetAllowlistValidator.assert_public_host(hostname, skip_private_check=allow_private)
 
     # 2. Find or auto-provision Website
     from sqlalchemy import select
@@ -193,7 +194,8 @@ async def dispatch_custom_scan(db: AsyncSession, request_data: CustomScanRequest
         raise ScopeViolationException("Invalid target URL; missing hostname")
 
     # 1. Enforce SSRF & Private Host Guardrails
-    TargetAllowlistValidator.assert_public_host(hostname)
+    allow_private = bool(request_data.options and request_data.options.allow_private_hosts)
+    TargetAllowlistValidator.assert_public_host(hostname, skip_private_check=allow_private)
 
     # 2. Find or auto-provision Website
     from sqlalchemy import select

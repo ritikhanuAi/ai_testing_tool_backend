@@ -20,6 +20,7 @@ class ContextFactory:
         target_url: str = "",
         record_video_dir: Optional[str] = None,
         is_mobile: bool = False,
+        allow_private_hosts: bool = False,
     ) -> BrowserContext:
         """Create a sandboxed browser context isolated from other scans."""
         vp_width = viewport_width or default_engine_config.viewport_width
@@ -61,6 +62,7 @@ class ContextFactory:
             allowed_hostnames=allowed_domains,
             max_requests_per_second=request_rate_limit,
             target_url=target_url,
+            allow_private_hosts=allow_private_hosts,
         )
         await context.route("**/*", guard.intercept_route)
 

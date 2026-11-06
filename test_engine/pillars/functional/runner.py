@@ -224,10 +224,25 @@ class FunctionalScanner(BasePillarScanner):
                 ))
 
         for case_idx, case in enumerate(cases):
-            permitted, _ = RiskPolicyChecker.is_execution_permitted(case, allow_state_changing)
+            permitted, skip_reason = RiskPolicyChecker.is_execution_permitted(case, allow_state_changing)
             if not permitted:
                 skipped_cases += 1
-                await _emit_progress(run_id, "FUNCTIONAL", f"Skipping state-changing case [{case.id}] (read-only mode)", 28)
+                await _emit_progress(run_id, "FUNCTIONAL", f"  ⚠ Skipped [{case.id}]: {skip_reason}", 28, level="WARNING")
+                executed_case_records.append({
+                    "id": case.id,
+                    "title": case.title,
+                    "module": next((t for t in (case.tags or []) if t.lower() not in ("boundary", "long_input", "email", "empty_required")), "General"),
+                    "test_type": _classify_test_type(case),
+                    "test_scenario": case.title,
+                    "expected_result": "; ".join(a.type.value for a in case.assertions) if case.assertions else "No assertions",
+                    "actual_result": f"SKIPPED: {skip_reason}",
+                    "pillar": case.pillar.value if hasattr(case.pillar, "value") else str(case.pillar),
+                    "risk": case.risk.value if hasattr(case.risk, "value") else str(case.risk),
+                    "steps": [],
+                    "assertions_count": len(case.assertions),
+                    "passed": False,
+                    "skipped": True,
+                })
                 continue
 
             executed_cases += 1

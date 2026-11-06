@@ -8,6 +8,9 @@ _ROLE_TARGET = re.compile(r"^role=(?P<role>[a-zA-Z][\w-]*)(?:\[name=(?P<name>.+)
 # never a real selector: HTML has no such element names. Failing at once avoids a long wait.
 _PLACEHOLDER_TARGET = re.compile(r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$")
 
+# XPath expressions: leading // (abbreviated syntax) or explicit xpath= prefix.
+_XPATH_TARGET = re.compile(r"^(xpath=.+|//.+)", re.DOTALL)
+
 
 class PlaceholderTargetError(ValueError):
     """Raised when a test step or assertion still uses a placeholder instead of a selector."""
@@ -18,13 +21,29 @@ def is_placeholder_target(target: str) -> bool:
 
 
 def resolve_locator(page, target: str):
-    """Resolve the compact role syntax used in test packs, or a normal Playwright selector."""
+    """Resolve a test-pack selector to a Playwright locator.
+
+    Supported selector forms:
+    - CSS:   ``#email``, ``input[type='password']``, ``[data-testid='btn']``
+    - Role:  ``role=button[name='Submit']``, ``role=textbox``
+    - XPath: ``//input[@id='email']``, ``xpath=//div[@class='modal']``
+    """
     if is_placeholder_target(target):
         raise PlaceholderTargetError(
             f"'{target.strip()}' is a placeholder, not a real selector. Replace it with a CSS "
-            "selector (e.g. #email, input[type='password']) or a role (e.g. role=button[name='Sign in'])."
+            "selector (e.g. #email, input[type='password']), a role "
+            "(e.g. role=button[name='Sign in']), or an XPath expression "
+            "(e.g. //input[@id='email'])."
         )
-    match = _ROLE_TARGET.fullmatch(target.strip())
+
+    stripped = target.strip()
+
+    if _XPATH_TARGET.match(stripped):
+        # Normalise to explicit xpath= prefix so Playwright's engine selection is unambiguous.
+        expr = stripped if stripped.startswith("xpath=") else f"xpath={stripped}"
+        return page.locator(expr)
+
+    match = _ROLE_TARGET.fullmatch(stripped)
     if not match:
         return page.locator(target)
 

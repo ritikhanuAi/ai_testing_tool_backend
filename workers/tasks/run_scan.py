@@ -183,7 +183,6 @@ def _matrix_batch_can_resume(matrix_pages: List[Dict[str, Any]]) -> bool:
             or not page.get("discovery_complete", True)
             or page.get("discovery_errors")
             or page.get("unsupported_controls")
-            or page.get("dynamic_controls")
             or page.get("undiscovered_custom_dropdowns")
             or page.get("resume_manifest_changed")
         ):
@@ -505,6 +504,7 @@ async def _async_execute_scan(
             target_url=target_url,
             record_video_dir=temp_video_dir,
             is_mobile=is_mobile,
+            allow_private_hosts=bool(profile.get("allow_private_hosts", False)),
         )
         if record_trace:
             await context.tracing.start(screenshots=True, snapshots=True, sources=True)
