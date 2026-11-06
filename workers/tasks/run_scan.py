@@ -592,12 +592,21 @@ async def _async_execute_scan(
                     text_values=list(profile.get("interaction_test_values") or []),
                     max_generated_cases=int(profile.get("max_generated_cases") or 1000),
                     include_action_order_permutations=bool(profile.get("include_action_order_permutations", False)),
+                    interaction_priority_order=list(profile.get("interaction_priority_order") or [
+                        "dropdown", "search", "navigation", "button"
+                    ]),
                     resume_state=matrix_resume_state,
                     checkpoint_callback=lambda checkpoint: _save_matrix_checkpoint(run_id, page_url, checkpoint),
                     deadline=interaction_deadline,
                     cancellation_check=lambda: _is_cancelled(run_id),
                 )
                 matrix["page_url"] = redact_url(page_url)
+                linked_routes = matrix.pop("linked_routes", [])
+                matrix["linked_routes_discovered"] = [redact_url(route) for route in linked_routes]
+                if matrix.get("complete"):
+                    for route in linked_routes:
+                        if route not in crawled_page.links:
+                            crawled_page.links.append(route)
                 page_combinatorial_results.append(matrix)
                 await ScanProgressTracker.log(
                     run_id,

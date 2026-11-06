@@ -186,13 +186,15 @@ Extend the Functional and Security pillars by instructing the AI to generate adv
 
 The following work was implemented for the requested module-focused testing workflow:
 
-- [x] Module scans default to the selected page only; linked-page traversal is opt-in.
+- [x] Module scans complete the selected page first, then follow directly linked pages by default; deeper traversal remains user-controlled.
 - [x] Selected modules execute sequentially, with stop/cancel support and visible scan progress.
 - [x] Discover finite domains for native/custom dropdowns, text/search inputs, checkbox/switch states, radio groups, tabs, safe buttons, and discrete sliders.
 - [x] Reset to the selected route for each interaction case and prevent interactions from silently continuing on another route.
 - [x] Finish the current page's interaction queue before following its linked pages; stop traversal when coverage is incomplete.
 - [x] Report planned, executed, passed, failed, blocked, and pending matrix cases, plus undiscovered or changing control domains.
-- [x] Group repeated same-name row buttons as alternatives, and only permute actions selected in a case.
+- [x] Group repeated same-name row buttons as alternatives; optional action-order permutations stay within each priority tier.
+- [x] Let scan owners set the factor priority order; the default order is dropdowns, search controls, linked-page navigation, then button actions. Active values are scheduled before no-op values so early cases exercise selected priorities, and permutations cannot cross priority tiers.
+- [x] Probe up to 40 safe disclosure controls during discovery and add revealed search fields and native/custom dropdowns to the matrix with their opening click as a replayed setup action.
 - [x] Execute the deterministic case prefix up to the configured per-page limit instead of aborting the page with zero cases.
 - [x] Disable screenshot-based VLM review in scan execution while retaining text-based LLM testing and fix suggestions.
 
@@ -202,7 +204,9 @@ Follow-up implementation status:
 - [x] Add automated coverage for domain discovery, matrix counts/order, continuation, route boundaries, cancellation, checkpoint persistence, and incomplete reports.
 - [x] Add safe row-context labels to repeated controls so identical accessible names remain distinguishable in the interaction matrix.
 
-The worker automatically queues another batch when the configured batch size or page interaction budget is reached, then continues from the saved cursor. Coverage remains incomplete for blocked cases, unstable or newly exposed controls, inaccessible domains, or checkpoint failures. Repeated row actions include a non-sensitive row heading, accessible label, or link name where available. Exhaustiveness is limited to discovered finite control domains and configured input values; arbitrary text and hidden application states cannot be enumerated.
+The worker automatically queues another batch when the configured batch size or page interaction budget is reached, then continues from the saved cursor. Safe staged discovery now adds revealed search fields and dropdowns with replayable setup actions; other newly revealed controls remain explicit coverage gaps. Coverage also remains incomplete for blocked cases, unstable domains, inaccessible controls, or checkpoint failures. Repeated row actions include a non-sensitive row heading, accessible label, or link name where available. Exhaustiveness is limited to discovered finite control domains and configured input values; arbitrary text and hidden application states cannot be enumerated.
+
+The prioritized discovery update also opens up to 40 safe controls with disclosure hints or names such as search, menu, filter, expand, select, status, category, or severity during manifest creation. Revealed search fields and native/custom dropdowns are added to the matrix with their opening click replayed as a setup action. Same-origin routes revealed in menus, popups, or safe navigation actions are queued after the selected page's full case queue completes. Other revealed control types remain coverage gaps.
 
 ### 📍 Sprint 1 (Foundation & Reliability - P0)
 - [ ] **Task 1.1:** Build DOM Distiller to provide real, verified selectors to the LLM.

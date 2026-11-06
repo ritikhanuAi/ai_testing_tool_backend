@@ -1,7 +1,7 @@
 import json
 import yaml
 from pydantic import BaseModel, Field, HttpUrl, field_validator
-from typing import Optional, List, Any, Union
+from typing import Optional, List, Any, Union, Literal
 from datetime import datetime
 from app.common.serializers import BaseSchema
 from app.common.constants import RunStatus
@@ -47,6 +47,12 @@ class AdvancedExecutionOptions(BaseModel):
         max_length=20,
         description="Finite values used for discovered text and search controls; an empty value is always included.",
     )
+    interaction_priority_order: List[Literal["dropdown", "search", "navigation", "button"]] = Field(
+        default_factory=lambda: ["dropdown", "search", "navigation", "button"],
+        min_length=4,
+        max_length=4,
+        description="Priority order for dropdown, search, linked-page navigation, and button interactions.",
+    )
     include_action_order_permutations: bool = False
     max_generated_cases: int = Field(
         default=1000,
@@ -71,6 +77,18 @@ class AdvancedExecutionOptions(BaseModel):
             if value not in cleaned:
                 cleaned.append(value)
         return cleaned
+
+    @field_validator("interaction_priority_order")
+    @classmethod
+    def validate_interaction_priority_order(
+        cls, values: List[str]
+    ) -> List[str]:
+        expected = {"dropdown", "search", "navigation", "button"}
+        if len(values) != len(expected) or set(values) != expected:
+            raise ValueError(
+                "Interaction priority order must contain dropdown, search, navigation, and button exactly once."
+            )
+        return values
 
 class QuickScanRequest(BaseModel):
     url: str = Field(..., description="Target website entry URL (e.g. https://example.com)")

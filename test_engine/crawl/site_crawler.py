@@ -536,6 +536,30 @@ class SiteCrawler:
                     if continue_crawl is False:
                         result.stopped_after_incomplete_page = True
                         queue.clear()
+                    else:
+                        discovered_after_interaction = crawled_page.links[len(normalized_links):]
+                        available_link_slots = max(0, max_links_per_page - len(normalized_links))
+                        if len(discovered_after_interaction) > available_link_slots:
+                            result.skipped_link_limit += len(discovered_after_interaction) - available_link_slots
+                        normalized_after_interaction = list(normalized_links)
+                        for href in discovered_after_interaction[:available_link_slots]:
+                            link, classification = cls._normalize_link(
+                                href, final_url, allowed_domains, start_port
+                            )
+                            if classification == "unsafe":
+                                result.skipped_unsafe += 1
+                            elif classification == "out_of_scope":
+                                result.skipped_out_of_scope += 1
+                            elif link:
+                                if link not in normalized_after_interaction:
+                                    normalized_after_interaction.append(link)
+                                if link not in enqueued:
+                                    enqueued.add(link)
+                                    if depth < max_depth:
+                                        queue.append((link, depth + 1))
+                                    else:
+                                        depth_limited.add(link)
+                        crawled_page.links = normalized_after_interaction
                 result.discovered_url_count = len(enqueued)
 
             result.skipped_depth_limit = len(depth_limited)

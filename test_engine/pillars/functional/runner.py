@@ -733,6 +733,7 @@ class FunctionalScanner(BasePillarScanner):
         text_values: Optional[List[str]] = None,
         max_generated_cases: int = 1000,
         include_action_order_permutations: bool = False,
+        interaction_priority_order: Optional[List[str]] = None,
         resume_state: Optional[Dict[str, Any]] = None,
         checkpoint_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
         deadline: Optional[float] = None,
@@ -743,16 +744,27 @@ class FunctionalScanner(BasePillarScanner):
             page,
             target_url=target_url,
             text_values=text_values or [],
+            priority_order=interaction_priority_order,
             deadline=deadline,
             cancellation_check=cancellation_check,
         )
         if not discovery.get("discovery_complete", True):
-            planned = estimate_case_count(discovery["factors"], include_action_order_permutations)
+            planned = estimate_case_count(
+                discovery["factors"],
+                include_action_order_permutations,
+                interaction_priority_order,
+            )
             result = {
                 "mode": "exhaustive_cartesian",
                 "page_url": redact_url(target_url),
                 "factors": [
-                    {"id": factor["id"], "label": factor["label"], "kind": factor["kind"], "values": [value["label"] for value in factor["values"]]}
+                    {
+                        "id": factor["id"],
+                        "label": factor["label"],
+                        "kind": factor["kind"],
+                        "values": [value["label"] for value in factor["values"]],
+                        "setup_actions": [action.get("label") for action in factor.get("setup_actions") or []],
+                    }
                     for factor in discovery["factors"]
                 ],
                 "factors_discovered": len(discovery["factors"]),
@@ -765,6 +777,9 @@ class FunctionalScanner(BasePillarScanner):
                 "case_limit": max_generated_cases,
                 "limit_exceeded": False,
                 "action_order_permutations": include_action_order_permutations,
+                "priority_order": list(interaction_priority_order or [
+                    "dropdown", "search", "navigation", "button"
+                ]),
                 "complete": False,
                 "interruption_reason": discovery["discovery_errors"][0],
                 "test_cases": [],
@@ -778,13 +793,19 @@ class FunctionalScanner(BasePillarScanner):
                 factors=discovery["factors"],
                 max_generated_cases=max_generated_cases,
                 include_action_order_permutations=include_action_order_permutations,
+                priority_order=interaction_priority_order,
                 baseline_controls=discovery.get("control_snapshot"),
                 resume_state=resume_state,
                 checkpoint_callback=checkpoint_callback,
                 deadline=deadline,
                 cancellation_check=cancellation_check,
             )
+        routes_from_cases = list(result.get("linked_routes") or [])
         result.update({key: value for key, value in discovery.items() if key not in {"factors", "control_snapshot"}})
+        result["linked_routes"] = list(dict.fromkeys([
+            *(discovery.get("linked_routes") or []),
+            *routes_from_cases,
+        ]))
         result["discovery_errors"] = discovery.get("discovery_errors", [])
         if discovery.get("undiscovered_custom_dropdowns"):
             result["complete"] = False

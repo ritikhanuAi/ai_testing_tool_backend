@@ -141,9 +141,12 @@ class FunctionalSpider:
                         type,
                         role,
                         name,
+                        href: el.getAttribute('href') || (tag === 'a' ? el.href : null),
                         context_name: contextName(el),
                         placeholder: el.getAttribute('placeholder') || '',
                         has_popup: el.getAttribute('aria-haspopup') || null,
+                        controls: el.getAttribute('aria-controls') || null,
+                        expanded: el.getAttribute('aria-expanded') || null,
                         required: !!el.required || el.getAttribute('aria-required') === 'true',
                         selected_value: tag === 'select' ? el.value : null,
                         checked: ['checkbox', 'radio'].includes(role) ? !!el.checked :
