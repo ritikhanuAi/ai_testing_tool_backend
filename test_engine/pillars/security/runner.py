@@ -1,16 +1,21 @@
 import asyncio
+import logging
 from typing import Any, Dict, List, Optional, Set
 from urllib.parse import urlsplit, urlunsplit
 
 from app.common.constants import FindingSeverity, PillarType
+from test_engine.config import default_engine_config
 from test_engine.crawl.site_crawler import CrawlResult, redact_url
 from test_engine.pillars.base import BasePillarScanner, PillarFinding, PillarScanResult
 from test_engine.pillars.security.cookies import CookieSecurityScanner
 from test_engine.pillars.security.exposures import SensitiveExposureScanner
 from test_engine.pillars.security.headers import SecurityHeadersScanner
+from test_engine.pillars.security.nuclei import NucleiScanner
 from test_engine.pillars.security.tls import TLSScanner
 from test_engine.policy.allowlist import TargetAllowlistValidator
 from test_engine.scoring.rubrics import calculate_pillar_deductions
+
+logger = logging.getLogger(__name__)
 
 
 class SecurityScanner(BasePillarScanner):
@@ -142,12 +147,14 @@ class SecurityScanner(BasePillarScanner):
         origins_skipped_unsafe = 0
         origins_probed = 0
         tls_probe_failed_origins: List[str] = []
+        approved_origins: List[str] = []
         for origin in origins[:self.MAX_ORIGINS_TO_PROBE]:
             hostname = urlsplit(origin).hostname or ""
             public, _ = await asyncio.to_thread(TargetAllowlistValidator.assert_public_host, hostname)
             if not public:
                 origins_skipped_unsafe += 1
                 continue
+            approved_origins.append(origin)
             exposure_findings, _ = await SensitiveExposureScanner.check_exposures(
                 origin, request_rate_limit=request_rate_limit
             )
@@ -169,6 +176,28 @@ class SecurityScanner(BasePillarScanner):
                 ))
             origins_probed += 1
             await asyncio.sleep(1.0 / max(request_rate_limit, 1))
+
+        nuclei_error: Optional[str] = None
+        nuclei_finding_count = 0
+        nuclei_targets_scanned: List[str] = []
+        if default_engine_config.nuclei_enabled and approved_origins:
+            if NucleiScanner.is_available():
+                try:
+                    nuclei_results = await NucleiScanner.scan_targets(approved_origins)
+                except Exception as error:  # noqa: BLE001 - must not fail the pillar
+                    logger.warning("Nuclei scan raised %s: %s", type(error).__name__, error)
+                    nuclei_results = None
+                    nuclei_error = f"{type(error).__name__}: {error}"
+                if nuclei_results is None:
+                    if nuclei_error is None:
+                        nuclei_error = "nuclei_no_output"
+                else:
+                    nuclei_findings = NucleiScanner.extract_findings(nuclei_results)
+                    findings.extend(nuclei_findings)
+                    nuclei_finding_count = len(nuclei_findings)
+                    nuclei_targets_scanned = [redact_url(origin) for origin in approved_origins]
+            else:
+                nuclei_error = "nuclei_cli_not_installed"
 
         if len(origins) > self.MAX_ORIGINS_TO_PROBE:
             findings.append(self._make_finding(
@@ -272,6 +301,14 @@ class SecurityScanner(BasePillarScanner):
                     "server_error_responses",
                     "common_sensitive_file_exposure",
                     "tls_certificate_and_protocol",
+                    "nuclei_template_scan",
                 ],
+                "nuclei": {
+                    "enabled": default_engine_config.nuclei_enabled,
+                    "available": NucleiScanner.is_available(),
+                    "targets_scanned": nuclei_targets_scanned,
+                    "finding_count": nuclei_finding_count,
+                    "error": nuclei_error,
+                },
             },
         )
