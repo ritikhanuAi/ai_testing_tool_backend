@@ -1,10 +1,15 @@
+import logging
 import math
 from typing import Any, Dict, List, Optional
 
 from app.common.constants import FindingSeverity, PillarType
+from test_engine.config import default_engine_config
 from test_engine.crawl.site_crawler import CrawlResult, CrawledPage, redact_url
 from test_engine.pillars.base import BasePillarScanner, PillarFinding, PillarScanResult
+from test_engine.pillars.performance.lighthouse import LighthouseScanner
 from test_engine.scoring.rubrics import calculate_pillar_deductions
+
+logger = logging.getLogger(__name__)
 
 
 class PerformanceScanner(BasePillarScanner):
@@ -125,6 +130,23 @@ class PerformanceScanner(BasePillarScanner):
             page_metrics.append({"url": redact_url(crawled_page.final_url), **metrics})
             findings.extend(self._page_findings(crawled_page, metrics))
 
+        lighthouse_metrics: Dict[str, Any] = {}
+        lighthouse_error: Optional[str] = None
+        if default_engine_config.lighthouse_enabled and LighthouseScanner.is_available():
+            try:
+                report = await LighthouseScanner.audit(target_url)
+            except Exception as error:  # noqa: BLE001 - must not fail the pillar
+                logger.warning("Lighthouse audit raised %s: %s", type(error).__name__, error)
+                report = None
+                lighthouse_error = f"{type(error).__name__}: {error}"
+            if report:
+                lighthouse_metrics = LighthouseScanner.extract_metrics(report)
+                findings.extend(LighthouseScanner.extract_findings(report, target_url))
+            elif lighthouse_error is None:
+                lighthouse_error = "lighthouse_no_report"
+        elif default_engine_config.lighthouse_enabled:
+            lighthouse_error = "lighthouse_cli_not_installed"
+
         successful_pages = sum(page.navigation_error is None for page in pages)
         metric_keys = ("fcp_ms", "lcp_ms", "cls", "inp_ms", "ttfb_ms", "load_ms", "tbt_ms", "resource_count")
         measured_pages = sum(any(metrics.get(key) is not None for key in metric_keys) for metrics in (
@@ -205,5 +227,12 @@ class PerformanceScanner(BasePillarScanner):
                     "No usable performance measurements were collected."
                     if measured_pages == 0 else "Score deductions are based on measured pages in this browser lab run."
                 ),
+                "lighthouse": {
+                    "enabled": default_engine_config.lighthouse_enabled,
+                    "available": LighthouseScanner.is_available(),
+                    "target_url": redact_url(target_url),
+                    "metrics": lighthouse_metrics,
+                    "error": lighthouse_error,
+                },
             },
         )

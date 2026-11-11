@@ -13,5 +13,6 @@ class EngineConfig(BaseModel):
     trace_on_failure: bool = True
     screenshot_on_failure: bool = True
     slow_mo_ms: int = 0
+    lighthouse_enabled: bool = True
 
 default_engine_config = EngineConfig()
