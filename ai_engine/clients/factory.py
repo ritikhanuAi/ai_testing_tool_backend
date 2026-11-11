@@ -18,5 +18,6 @@ class LLMClientFactory:
                 base_url=_GEMINI_BASE_URL,
                 api_key=ai_config.gemini_api_key,
                 model=ai_config.gemini_model,
+                provider="gemini",
             )
-        return RemoteLLMClient()
+        return RemoteLLMClient(provider=provider)

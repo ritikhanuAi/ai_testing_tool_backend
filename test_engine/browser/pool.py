@@ -1,6 +1,9 @@
 from playwright.async_api import async_playwright, Playwright, Browser
 from typing import Optional, Dict, Any
 from test_engine.config import default_engine_config
+import logging
+
+logger = logging.getLogger(__name__)
 
 class BrowserPool:
     """Manages Playwright lifecycle and headless browser instances."""
@@ -50,10 +53,20 @@ class BrowserPool:
     @classmethod
     async def close(cls):
         """Clean shutdown of browser and playwright engine."""
-        for b in cls._browsers.values():
-            if b and b.is_connected():
-                await b.close()
+        browsers = list(cls._browsers.values())
+        playwright = cls._playwright
         cls._browsers.clear()
-        if cls._playwright:
-            await cls._playwright.stop()
-            cls._playwright = None
+        cls._playwright = None
+
+        for browser in browsers:
+            try:
+                if browser and browser.is_connected():
+                    await browser.close()
+            except Exception as exc:
+                logger.debug("Could not close Playwright browser cleanly: %s", exc)
+
+        if playwright:
+            try:
+                await playwright.stop()
+            except Exception as exc:
+                logger.debug("Could not stop Playwright cleanly: %s", exc)

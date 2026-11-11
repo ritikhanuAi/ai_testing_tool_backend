@@ -1,6 +1,7 @@
 import httpx 
 from typing import Optional, Dict, Any, List
 from ai_engine.clients.base import BaseLLMClient
+from ai_engine.clients.usage import record_token_usage
 
 from ai_engine.config import ai_config
 
@@ -11,12 +12,16 @@ class RemoteLLMClient(BaseLLMClient):
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
         model: Optional[str] = None,
-        timeout: Optional[int] = None
+        timeout: Optional[int] = None,
+        provider: Optional[str] = None,
     ):
         self.base_url = (base_url or ai_config.remote_llm_base_url).rstrip("/")
         self.api_key = (api_key or ai_config.remote_llm_api_key)
         self.model = model or ai_config.remote_llm_model
         self.timeout = float(timeout or ai_config.timeout_seconds)
+        self.provider = provider or (
+            "gemini" if "generativelanguage.googleapis.com" in self.base_url else "remote"
+        )
 
     def _get_headers(self) -> Dict[str, str]:
 
@@ -49,6 +54,11 @@ class RemoteLLMClient(BaseLLMClient):
             res = await client.post(endpoint, json=payload, headers=self._get_headers())
             res.raise_for_status()
             data = res.json()
+            record_token_usage(
+                data.get("usage") or data.get("usageMetadata"),
+                provider=self.provider,
+                model=self.model,
+            )
             
             message = data["choices"][0]["message"]
             content = message.get("content") or ""
@@ -84,6 +94,11 @@ class RemoteLLMClient(BaseLLMClient):
             res = await client.post(endpoint, json=payload, headers=self._get_headers())
             res.raise_for_status()
             data = res.json()
+            record_token_usage(
+                data.get("usage") or data.get("usageMetadata"),
+                provider=self.provider,
+                model=self.model,
+            )
             
             message = data["choices"][0]["message"]
             content = message.get("content") or ""

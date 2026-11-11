@@ -1,8 +1,9 @@
 """Deterministic finite-domain interaction coverage for the current page.
 
-The suite enumerates the Cartesian product of discoverable safe control values. Text
-inputs have an explicit finite domain supplied by the scan options. Action-order
-permutations are opt-in and stay within each configured priority tier.
+The suite can enumerate the full Cartesian product or a deterministic pairwise
+covering set of discoverable safe control values. Text inputs have an explicit
+finite domain supplied by the scan options. Action-order permutations are opt-in
+and stay within each configured priority tier.
 """
 
 import asyncio
@@ -26,7 +27,8 @@ from test_engine.schema.actions import ActionStep, ActionType
 
 
 DEFAULT_INTERACTION_PRIORITY_ORDER = ("dropdown", "search", "navigation", "button")
-INTERACTION_CASE_ORDER_VERSION = 2
+INTERACTION_CASE_ORDER_VERSION = 3
+MAX_PAIRWISE_REQUIREMENTS = 250_000
 
 
 def _same_origin_http_route(candidate: str, base_url: str) -> Optional[str]:
@@ -64,6 +66,12 @@ def _factor_priority_kind(factor: Dict[str, Any]) -> str:
     return "other"
 
 
+def factor_category(factor: Dict[str, Any]) -> str:
+    """Map a discovered factor into the user-selectable category list."""
+    priority_kind = _factor_priority_kind(factor)
+    return priority_kind if priority_kind != "other" else "form"
+
+
 def _ordered_priority_categories(priority_order: Optional[List[str]] = None) -> List[str]:
     order = [category for category in (priority_order or DEFAULT_INTERACTION_PRIORITY_ORDER)
              if category in DEFAULT_INTERACTION_PRIORITY_ORDER]
@@ -90,6 +98,43 @@ def _is_safe_discovery_trigger(item: Dict[str, Any]) -> bool:
             or any(word in name for word in trigger_words)
         )
     )
+
+
+async def _click_discovered_control(page: Page, item: Dict[str, Any], timeout_ms: int) -> None:
+    """Click a discovered control by accessible name, with its CSS path as fallback."""
+    role = str(item.get("fallback_role") or item.get("role") or "").strip()
+    name = str(item.get("fallback_name") or item.get("name") or "").strip()
+    errors: List[Exception] = []
+
+    if role and name:
+        try:
+            candidates = page.get_by_role(role, name=name, exact=True)
+            count = await candidates.count()
+            visible = []
+            for index in range(min(count, 20)):
+                candidate = candidates.nth(index)
+                if await candidate.is_visible():
+                    visible.append(candidate)
+            if len(visible) == 1:
+                await visible[0].click(timeout=timeout_ms)
+                return
+        except Exception as error:
+            errors.append(error)
+
+    selector = str(item.get("selector") or "").strip()
+    if selector:
+        try:
+            candidates = page.locator(selector)
+            if await candidates.count() == 1 and await candidates.is_visible():
+                await candidates.click(timeout=timeout_ms)
+                return
+        except Exception as error:
+            errors.append(error)
+
+    if errors:
+        raise errors[-1]
+    description = f"role={role!r}, name={name!r}" if role and name else f"selector={selector!r}"
+    raise TimeoutError(f"Could not uniquely locate a visible discovered control ({description}).")
 
 
 def _prioritize_factors(
@@ -272,6 +317,7 @@ async def discover_interaction_factors(
     target_url: str,
     text_values: List[str],
     priority_order: Optional[List[str]] = None,
+    included_categories: Optional[List[str]] = None,
     deadline: Optional[float] = None,
     cancellation_check: Optional[Callable[[], Awaitable[bool]]] = None,
 ) -> Dict[str, Any]:
@@ -750,7 +796,7 @@ async def discover_interaction_factors(
             if parent_failed:
                 continue
             before_pages = set(page.context.pages)
-            await page.locator(trigger_selector).click(timeout=2500)
+            await _click_discovered_control(page, trigger, timeout_ms=2500)
             await page.wait_for_timeout(250)
             new_pages = [candidate for candidate in page.context.pages if candidate not in before_pages]
             for candidate in new_pages:
@@ -993,7 +1039,7 @@ async def discover_interaction_factors(
                     links_before_dropdown = len(linked_routes)
                     menu_actions_added = 0
                     try:
-                        await page.locator(revealed_selector).click(timeout=2000)
+                        await _click_discovered_control(page, revealed, timeout_ms=2000)
                         options = page.locator('[role="option"]:visible')
                         try:
                             await options.first.wait_for(state="visible", timeout=1200)
@@ -1147,7 +1193,15 @@ async def discover_interaction_factors(
             discovery_complete = False
             discovery_errors.append(f"Could not restore the selected page after control discovery: {redact_text(str(error))[:180]}")
 
-    factors = _prioritize_factors(_group_equivalent_safe_buttons(factors), priority_order)
+    grouped_factors = _group_equivalent_safe_buttons(factors)
+    selected_categories = set(included_categories or [
+        "dropdown", "search", "navigation", "button", "form"
+    ])
+    selected_factors = [
+        factor for factor in grouped_factors
+        if factor_category(factor) in selected_categories
+    ]
+    factors = _prioritize_factors(selected_factors, priority_order)
 
     return {
         "factors": factors,
@@ -1165,6 +1219,8 @@ async def discover_interaction_factors(
         },
         "interactive_controls_discovered": len(expanded_catalog),
         "factors_discovered": len(factors),
+        "factors_discovered_before_category_filter": len(grouped_factors),
+        "interaction_categories": sorted(selected_categories),
         "priority_order": list(priority_order or DEFAULT_INTERACTION_PRIORITY_ORDER),
         "dynamic_controls_discovered": dynamic_discovered,
         "linked_routes": linked_routes,
@@ -1211,17 +1267,245 @@ def estimate_case_count(
     )
 
 
+def _normalize_label(value: Any) -> str:
+    return " ".join(str(value or "").casefold().split())
+
+
+def resolve_required_combinations(
+    factors: List[Dict[str, Any]],
+    required_combinations: Optional[List[Dict[str, str]]] = None,
+) -> tuple[List[tuple[int, ...]], List[str]]:
+    """Resolve factor labels/IDs and value labels into stable domain indexes."""
+    default_indexes = tuple(
+        next(
+            (index for index, value in enumerate(factor.get("values") or []) if value.get("action") is None),
+            0,
+        )
+        for factor in factors
+    )
+    rows: List[tuple[int, ...]] = []
+    errors: List[str] = []
+    for combo_number, combo in enumerate(required_combinations or [], start=1):
+        row = list(default_indexes)
+        for control_label, value_label in combo.items():
+            factor_matches = [
+                index for index, factor in enumerate(factors)
+                if _normalize_label(factor.get("id")) == _normalize_label(control_label)
+            ]
+            if not factor_matches:
+                factor_matches = [
+                    index for index, factor in enumerate(factors)
+                    if _normalize_label(factor.get("label")) == _normalize_label(control_label)
+                ]
+            if len(factor_matches) != 1:
+                reason = "was not found" if not factor_matches else "matches more than one discovered control"
+                errors.append(f"Required combination {combo_number}: control '{control_label}' {reason}.")
+                continue
+            factor_index = factor_matches[0]
+            value_matches = [
+                index for index, value in enumerate(factors[factor_index].get("values") or [])
+                if _normalize_label(value.get("label")) == _normalize_label(value_label)
+            ]
+            if len(value_matches) != 1:
+                reason = "was not found" if not value_matches else "matches more than one value"
+                errors.append(
+                    f"Required combination {combo_number}: value '{value_label}' {reason} "
+                    f"for control '{control_label}'."
+                )
+                continue
+            row[factor_index] = value_matches[0]
+        row_tuple = tuple(row)
+        if row_tuple not in rows:
+            rows.append(row_tuple)
+    return rows, errors
+
+
+def pairwise_case_indexes(
+    factors: List[Dict[str, Any]],
+    required_rows: Optional[List[tuple[int, ...]]] = None,
+) -> tuple[List[tuple[int, ...]], Optional[str]]:
+    """Build a deterministic greedy covering array for every pair of factors."""
+    if not factors:
+        return [], None
+    domains = [factor.get("values") or [] for factor in factors]
+    if any(not domain for domain in domains):
+        return [], "Pairwise coverage cannot run because a discovered control has no values."
+
+    requirement_count = sum(len(domain) for domain in domains)
+    requirement_count += sum(
+        len(domains[left]) * len(domains[right])
+        for left in range(len(domains))
+        for right in range(left + 1, len(domains))
+    )
+    if requirement_count > MAX_PAIRWISE_REQUIREMENTS:
+        return [], (
+            f"Pairwise plan has {requirement_count} value-pair requirements, above the safe limit "
+            f"of {MAX_PAIRWISE_REQUIREMENTS}; select fewer control categories or values."
+        )
+
+    default_row = tuple(
+        next(
+            (index for index, value in enumerate(domain) if value.get("action") is None),
+            0,
+        )
+        for domain in domains
+    )
+    rows: List[tuple[int, ...]] = []
+    for row in [default_row, *(required_rows or [])]:
+        if len(row) == len(domains) and row not in rows:
+            rows.append(row)
+
+    uncovered = {
+        (factor_index, value_index, -1, -1)
+        for factor_index, domain in enumerate(domains)
+        for value_index in range(len(domain))
+    }
+    uncovered.update(
+        (left, left_value, right, right_value)
+        for left in range(len(domains))
+        for right in range(left + 1, len(domains))
+        for left_value in range(len(domains[left]))
+        for right_value in range(len(domains[right]))
+    )
+
+    def remove_covered(row: tuple[int, ...]) -> None:
+        for factor_index, value_index in enumerate(row):
+            uncovered.discard((factor_index, value_index, -1, -1))
+        for left in range(len(row)):
+            for right in range(left + 1, len(row)):
+                uncovered.discard((left, row[left], right, row[right]))
+
+    for row in rows:
+        remove_covered(row)
+
+    while uncovered:
+        anchor = min(uncovered, key=lambda item: (item[0], item[2], item[1], item[3]))
+        row: List[Optional[int]] = [None] * len(domains)
+        row[anchor[0]] = anchor[1]
+        if anchor[2] >= 0:
+            row[anchor[2]] = anchor[3]
+
+        for factor_index, domain in enumerate(domains):
+            if row[factor_index] is not None:
+                continue
+
+            def candidate_score(candidate: int) -> int:
+                score = int((factor_index, candidate, -1, -1) in uncovered)
+                for assigned_index, assigned_value in enumerate(row):
+                    if assigned_value is None:
+                        continue
+                    if assigned_index < factor_index:
+                        key = (assigned_index, assigned_value, factor_index, candidate)
+                    else:
+                        key = (factor_index, candidate, assigned_index, assigned_value)
+                    score += int(key in uncovered)
+                return score
+
+            row[factor_index] = max(range(len(domain)), key=lambda candidate: (candidate_score(candidate), -candidate))
+
+        completed_row = tuple(int(value) for value in row)
+        if completed_row not in rows:
+            rows.append(completed_row)
+        remove_covered(completed_row)
+
+    return rows, None
+
+
+def _iter_case_orders(
+    factors: List[Dict[str, Any]],
+    selected_values: tuple[Dict[str, Any], ...],
+    include_action_order_permutations: bool,
+    priority_order: Optional[List[str]],
+):
+    active_indexes = tuple(
+        index for index, value in enumerate(selected_values)
+        if value.get("action") is not None
+    )
+    if not include_action_order_permutations:
+        yield active_indexes
+        return
+
+    categories = _ordered_priority_categories(priority_order)
+    active_by_priority = [
+        tuple(
+            index for index in active_indexes
+            if _factor_priority_kind(factors[index]) == category
+        )
+        for category in categories
+    ]
+
+    def combine_priority_orders(category_index: int, prefix: tuple = ()):
+        if category_index >= len(active_by_priority):
+            yield prefix
+            return
+        category_indexes = active_by_priority[category_index]
+        category_orders = itertools.permutations(category_indexes) if category_indexes else [()]
+        for category_order in category_orders:
+            yield from combine_priority_orders(category_index + 1, (*prefix, *category_order))
+
+    yield from combine_priority_orders(0)
+
+
+def _count_case_orders(
+    factors: List[Dict[str, Any]],
+    selected_values: tuple[Dict[str, Any], ...],
+    include_action_order_permutations: bool,
+    priority_order: Optional[List[str]],
+) -> int:
+    if not include_action_order_permutations:
+        return 1
+    categories = _ordered_priority_categories(priority_order)
+    return math.prod(
+        math.factorial(sum(
+            value.get("action") is not None
+            and _factor_priority_kind(factors[index]) == category
+            for index, value in enumerate(selected_values)
+        ))
+        for category in categories
+    )
+
+
+def build_interaction_plan(
+    factors: List[Dict[str, Any]],
+    *,
+    coverage_mode: str,
+    include_action_order_permutations: bool,
+    priority_order: Optional[List[str]],
+    required_combinations: Optional[List[Dict[str, str]]],
+) -> tuple[int, List[tuple[int, ...]], List[str]]:
+    """Return planned case count, pairwise rows/required rows, and config errors."""
+    required_rows, errors = resolve_required_combinations(factors, required_combinations)
+    if coverage_mode == "pairwise":
+        rows, plan_error = pairwise_case_indexes(factors, required_rows)
+        if plan_error:
+            errors.append(plan_error)
+            return 0, rows, errors
+        planned = 0
+        for row in rows:
+            selected = tuple(factors[index]["values"][value_index] for index, value_index in enumerate(row))
+            planned += _count_case_orders(
+                factors, selected, include_action_order_permutations, priority_order
+            )
+        return planned, rows, errors
+
+    return estimate_case_count(factors, include_action_order_permutations, priority_order), required_rows, errors
+
+
 def interaction_manifest_fingerprint(
     target_url: str,
     factors: List[Dict[str, Any]],
     include_action_order_permutations: bool,
     priority_order: Optional[List[str]] = None,
+    coverage_mode: str = "exhaustive",
+    planned_rows: Optional[List[tuple[int, ...]]] = None,
 ) -> str:
     """Stable identity for deciding whether a saved page cursor is still valid."""
     manifest = {
         "target_url": target_url,
         "include_action_order_permutations": include_action_order_permutations,
         "priority_order": list(priority_order or DEFAULT_INTERACTION_PRIORITY_ORDER),
+        "coverage_mode": coverage_mode,
+        "planned_rows": planned_rows,
         "case_order_version": INTERACTION_CASE_ORDER_VERSION,
         "factors": [
             {
@@ -1256,6 +1540,8 @@ async def execute_interaction_matrix(
     max_generated_cases: int,
     include_action_order_permutations: bool,
     priority_order: Optional[List[str]] = None,
+    coverage_mode: str = "exhaustive",
+    required_combinations: Optional[List[Dict[str, str]]] = None,
     baseline_controls: Optional[Dict[str, Dict[str, Any]]] = None,
     resume_state: Optional[Dict[str, Any]] = None,
     checkpoint_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
@@ -1263,9 +1549,20 @@ async def execute_interaction_matrix(
     cancellation_check: Optional[Callable[[], Awaitable[bool]]] = None,
 ) -> Dict[str, Any]:
     """Execute a stable manifest prefix, resetting the selected URL per case."""
-    planned = estimate_case_count(factors, include_action_order_permutations, priority_order)
+    planned, planned_rows, plan_errors = build_interaction_plan(
+        factors,
+        coverage_mode=coverage_mode,
+        include_action_order_permutations=include_action_order_permutations,
+        priority_order=priority_order,
+        required_combinations=required_combinations,
+    )
     manifest_fingerprint = interaction_manifest_fingerprint(
-        target_url, factors, include_action_order_permutations, priority_order
+        target_url,
+        factors,
+        include_action_order_permutations,
+        priority_order,
+        coverage_mode,
+        planned_rows,
     )
     resume_state = resume_state or {}
     saved_cursor = int(resume_state.get("next_case_index") or 0)
@@ -1279,7 +1576,8 @@ async def execute_interaction_matrix(
     start_case_index = int(resume_state.get("next_case_index") or 0) if resume_matches else 0
     start_case_index = min(max(0, start_case_index), planned)
     result: Dict[str, Any] = {
-        "mode": "exhaustive_cartesian",
+        "mode": "pairwise" if coverage_mode == "pairwise" else "exhaustive_cartesian",
+        "coverage_mode": coverage_mode,
         "page_url": redact_url(target_url),
         "factors": [
             {
@@ -1302,7 +1600,7 @@ async def execute_interaction_matrix(
         "limit_exceeded": False,
         "action_order_permutations": include_action_order_permutations,
         "priority_order": list(priority_order or DEFAULT_INTERACTION_PRIORITY_ORDER),
-        "complete": planned == 0 or (resume_matches and start_case_index == planned),
+        "complete": not plan_errors and (planned == 0 or (resume_matches and start_case_index == planned)),
         "interruption_reason": None,
         "test_cases": list(resume_state.get("test_cases") or []) if resume_matches else [],
         "dynamic_controls": [],
@@ -1311,6 +1609,12 @@ async def execute_interaction_matrix(
         "next_case_index": start_case_index,
         "resume_manifest_changed": resume_manifest_changed,
     }
+    if plan_errors:
+        result["complete"] = False
+        result["required_combination_errors"] = plan_errors
+        result["interruption_reason"] = "; ".join(plan_errors)
+        return result
+
     baseline_controls = baseline_controls or {}
     dynamic_control_keys = set()
     known_menu_option_names = {
@@ -1320,7 +1624,8 @@ async def execute_interaction_matrix(
         for value in factor.get("values") or []
     }
     if not factors:
-        result["interruption_reason"] = "No eligible finite-domain controls were discovered on this page."
+        result["complete"] = True
+        result["interruption_reason"] = "No eligible controls remained after applying selected interaction categories."
         return result
     persisted_manifest = [
         {
@@ -1351,55 +1656,59 @@ async def execute_interaction_matrix(
             return result
 
     def iter_manifest_cases():
-        factor_positions = {factor["id"]: index for index, factor in enumerate(factors)}
-        priority_categories = _ordered_priority_categories(priority_order)
-        priority_rank = {category: index for index, category in enumerate(priority_categories)}
-        # Secondary dimensions stay at their discovered starting state while
-        # the P1 dimensions cycle first. Then the full Cartesian space continues.
-        case_order_factors = sorted(
-            factors,
-            key=lambda factor: (
-                0 if _factor_priority_kind(factor) == "other" else 1,
-                factor_positions[factor["id"]]
-                if _factor_priority_kind(factor) == "other"
-                else -priority_rank.get(_factor_priority_kind(factor), len(priority_rank)),
-            ),
-        )
-        for ordered_values in itertools.product(*(factor["values"] for factor in case_order_factors)):
-            selected_by_factor = {
-                factor["id"]: value
-                for factor, value in zip(case_order_factors, ordered_values)
-            }
-            selected_values = tuple(selected_by_factor[factor["id"]] for factor in factors)
-            active_factor_indexes = tuple(
-                index for index, factor in enumerate(factors)
-                if selected_by_factor.get(factor["id"], {}).get("action") is not None
+        if coverage_mode == "pairwise":
+            assignments = (
+                tuple(factors[index]["values"][value_index] for index, value_index in enumerate(row))
+                for row in planned_rows
             )
-            if include_action_order_permutations:
-                active_by_priority = [
-                    tuple(
-                        index for index in active_factor_indexes
-                        if _factor_priority_kind(factors[index]) == category
+        else:
+            factor_positions = {factor["id"]: index for index, factor in enumerate(factors)}
+            priority_categories = _ordered_priority_categories(priority_order)
+            priority_rank = {category: index for index, category in enumerate(priority_categories)}
+            # Secondary dimensions stay at their discovered starting state while
+            # the P1 dimensions cycle first. Then the full Cartesian space continues.
+            case_order_factors = sorted(
+                factors,
+                key=lambda factor: (
+                    0 if _factor_priority_kind(factor) == "other" else 1,
+                    factor_positions[factor["id"]]
+                    if _factor_priority_kind(factor) == "other"
+                    else -priority_rank.get(_factor_priority_kind(factor), len(priority_rank)),
+                ),
+            )
+
+            def exhaustive_assignments():
+                required_set = set(planned_rows)
+                for row in planned_rows:
+                    yield tuple(
+                        factors[index]["values"][value_index]
+                        for index, value_index in enumerate(row)
                     )
-                    for category in priority_categories
-                ]
 
-                def combine_priority_orders(category_index: int, prefix: tuple = ()):
-                    if category_index >= len(active_by_priority):
-                        yield prefix
-                        return
-                    category_indexes = active_by_priority[category_index]
-                    category_orders = itertools.permutations(category_indexes) if category_indexes else [()]
-                    for category_order in category_orders:
-                        yield from combine_priority_orders(
-                            category_index + 1,
-                            (*prefix, *category_order),
-                        )
+                for ordered_indexes in itertools.product(
+                    *(range(len(factor["values"])) for factor in case_order_factors)
+                ):
+                    selected_by_factor = {
+                        factor["id"]: value_index
+                        for factor, value_index in zip(case_order_factors, ordered_indexes)
+                    }
+                    row = tuple(selected_by_factor[factor["id"]] for factor in factors)
+                    if row in required_set:
+                        continue
+                    yield tuple(
+                        factor["values"][selected_by_factor[factor["id"]]]
+                        for factor in factors
+                    )
 
-                orders = combine_priority_orders(0)
-            else:
-                orders = [active_factor_indexes]
-            for order in orders:
+            assignments = exhaustive_assignments()
+
+        for selected_values in assignments:
+            for order in _iter_case_orders(
+                factors,
+                selected_values,
+                include_action_order_permutations,
+                priority_order,
+            ):
                 yield selected_values, tuple(order)
 
     batch_executed_cases = 0
@@ -1409,7 +1718,7 @@ async def execute_interaction_matrix(
     ):
             selected_by_factor = {factor["id"]: value for factor, value in zip(factors, selected_values)}
             if cancellation_check and await cancellation_check():
-                raise asyncio.CancelledError("Scan cancelled during exhaustive interaction testing")
+                raise asyncio.CancelledError("Scan cancelled during interaction matrix testing")
             if deadline is not None and time.monotonic() >= deadline:
                 result["pending_cases"] = planned - result["executed_cases"]
                 result["complete"] = result["pending_cases"] == 0 and result["blocked_cases"] == 0 and not result["dynamic_controls"]

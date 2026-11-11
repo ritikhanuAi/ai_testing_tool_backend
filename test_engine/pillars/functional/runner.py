@@ -28,8 +28,8 @@ from test_engine.schema.case import TestCaseModel
 from test_engine.crawl.site_crawler import CrawlResult, redact_text, redact_url
 from test_engine.scoring.rubrics import calculate_pillar_deductions
 from test_engine.pillars.functional.combinatorial import (
+    build_interaction_plan,
     discover_interaction_factors,
-    estimate_case_count,
     execute_interaction_matrix,
 )
 
@@ -156,6 +156,7 @@ class FunctionalScanner(BasePillarScanner):
         supplied_cases = bool(test_cases) or not use_ai
         cases = list(test_cases or [])
         exhaustive_mode = bool(kwargs.get("exhaustive_interactions", False))
+        interaction_coverage_mode = str(kwargs.get("interaction_coverage_mode") or "exhaustive")
         if not supplied_cases and not exhaustive_mode:
             suite_started = time.perf_counter()
             cases = await AITestCaseGenerator.generate_suite_for_forms(forms, target_url)
@@ -637,7 +638,12 @@ class FunctionalScanner(BasePillarScanner):
                 "react_actions": react_actions,
                 "react_completed": react_completed,
                 "interaction_coverage_mode": (
-                    "exhaustive_cartesian" if exhaustive_mode else "ai_exploratory" if use_ai else "authored_cases"
+                    next(
+                        (item.get("mode") or item.get("coverage_mode") for item in combinatorial_results),
+                        "pairwise" if interaction_coverage_mode == "pairwise" else "exhaustive_cartesian",
+                    )
+                    if exhaustive_mode
+                    else "ai_exploratory" if use_ai else "authored_cases"
                 ),
                 "page_interaction_journeys": len(precomputed_ai_journeys),
                 "pages_with_interaction_actions": sum(
@@ -734,28 +740,35 @@ class FunctionalScanner(BasePillarScanner):
         max_generated_cases: int = 1000,
         include_action_order_permutations: bool = False,
         interaction_priority_order: Optional[List[str]] = None,
+        interaction_coverage_mode: str = "exhaustive",
+        interaction_categories: Optional[List[str]] = None,
+        interaction_required_combinations: Optional[List[Dict[str, str]]] = None,
         resume_state: Optional[Dict[str, Any]] = None,
         checkpoint_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
         deadline: Optional[float] = None,
         cancellation_check: Optional[Callable[[], Awaitable[bool]]] = None,
     ) -> Dict[str, Any]:
-        """Discover the page's finite factors and run their full Cartesian suite."""
+        """Discover page factors and run the configured exhaustive or pairwise suite."""
         discovery = await discover_interaction_factors(
             page,
             target_url=target_url,
             text_values=text_values or [],
             priority_order=interaction_priority_order,
+            included_categories=interaction_categories,
             deadline=deadline,
             cancellation_check=cancellation_check,
         )
         if not discovery.get("discovery_complete", True):
-            planned = estimate_case_count(
+            planned, _, plan_errors = build_interaction_plan(
                 discovery["factors"],
-                include_action_order_permutations,
-                interaction_priority_order,
+                coverage_mode=interaction_coverage_mode,
+                include_action_order_permutations=include_action_order_permutations,
+                priority_order=interaction_priority_order,
+                required_combinations=interaction_required_combinations,
             )
             result = {
-                "mode": "exhaustive_cartesian",
+                "mode": "pairwise" if interaction_coverage_mode == "pairwise" else "exhaustive_cartesian",
+                "coverage_mode": interaction_coverage_mode,
                 "page_url": redact_url(target_url),
                 "factors": [
                     {
@@ -781,7 +794,7 @@ class FunctionalScanner(BasePillarScanner):
                     "dropdown", "search", "navigation", "button"
                 ]),
                 "complete": False,
-                "interruption_reason": discovery["discovery_errors"][0],
+                "interruption_reason": "; ".join([*discovery["discovery_errors"], *plan_errors]),
                 "test_cases": [],
                 "dynamic_controls": [],
             }
@@ -794,6 +807,8 @@ class FunctionalScanner(BasePillarScanner):
                 max_generated_cases=max_generated_cases,
                 include_action_order_permutations=include_action_order_permutations,
                 priority_order=interaction_priority_order,
+                coverage_mode=interaction_coverage_mode,
+                required_combinations=interaction_required_combinations,
                 baseline_controls=discovery.get("control_snapshot"),
                 resume_state=resume_state,
                 checkpoint_callback=checkpoint_callback,
@@ -807,6 +822,10 @@ class FunctionalScanner(BasePillarScanner):
             *routes_from_cases,
         ]))
         result["discovery_errors"] = discovery.get("discovery_errors", [])
+        if result["discovery_errors"]:
+            result["complete"] = False
+            if not result.get("interruption_reason"):
+                result["interruption_reason"] = "One or more controls revealed during discovery could not be inspected."
         if discovery.get("undiscovered_custom_dropdowns"):
             result["complete"] = False
             result["interruption_reason"] = (

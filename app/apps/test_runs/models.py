@@ -22,6 +22,15 @@ class TestRun(BaseModel):
     performance_score = Column(Float, nullable=True)
     accessibility_score = Column(Float, nullable=True)
 
+    llm_provider = Column(String(50), nullable=True)
+    llm_model = Column(String(255), nullable=True)
+    llm_call_count = Column(Integer, default=0, nullable=False)
+    llm_usage_reported_calls = Column(Integer, default=0, nullable=False)
+    llm_prompt_tokens = Column(Integer, default=0, nullable=False)
+    llm_completion_tokens = Column(Integer, default=0, nullable=False)
+    llm_reasoning_tokens = Column(Integer, default=0, nullable=False)
+    llm_total_tokens = Column(Integer, default=0, nullable=False)
+
     started_at = Column(DateTime(timezone=True), nullable=True)
     completed_at = Column(DateTime(timezone=True), nullable=True)
     error_message = Column(Text, nullable=True)

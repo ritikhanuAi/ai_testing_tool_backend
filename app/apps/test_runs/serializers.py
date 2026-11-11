@@ -1,7 +1,7 @@
 import json
 import yaml
 from pydantic import BaseModel, Field, HttpUrl, field_validator
-from typing import Optional, List, Any, Union, Literal
+from typing import Optional, List, Any, Union, Literal, Dict
 from datetime import datetime
 from app.common.serializers import BaseSchema
 from app.common.constants import RunStatus
@@ -53,6 +53,21 @@ class AdvancedExecutionOptions(BaseModel):
         max_length=4,
         description="Priority order for dropdown, search, linked-page navigation, and button interactions.",
     )
+    interaction_coverage_mode: Literal["exhaustive", "pairwise"] = Field(
+        default="exhaustive",
+        description="Full Cartesian coverage or pairwise value coverage; applies when exhaustive_interactions is enabled.",
+    )
+    interaction_categories: List[Literal["dropdown", "search", "navigation", "button", "form"]] = Field(
+        default_factory=lambda: ["dropdown", "search", "navigation", "button", "form"],
+        min_length=1,
+        max_length=5,
+        description="Control categories included in the interaction suite. Form includes tabs, checkboxes, radios, sliders, and ordinary text fields.",
+    )
+    interaction_required_combinations: List[Dict[str, str]] = Field(
+        default_factory=list,
+        max_length=100,
+        description="Control label or reported factor ID to value label mappings to include, for example {'Status': 'Closed', 'Search': 'sample'}.",
+    )
     include_action_order_permutations: bool = False
     max_generated_cases: int = Field(
         default=1000,
@@ -89,6 +104,34 @@ class AdvancedExecutionOptions(BaseModel):
                 "Interaction priority order must contain dropdown, search, navigation, and button exactly once."
             )
         return values
+
+    @field_validator("interaction_categories")
+    @classmethod
+    def validate_interaction_categories(cls, values: List[str]) -> List[str]:
+        if len(values) != len(set(values)):
+            raise ValueError("Interaction categories must not contain duplicates.")
+        return values
+
+    @field_validator("interaction_required_combinations")
+    @classmethod
+    def validate_interaction_required_combinations(
+        cls, combinations: List[Dict[str, str]]
+    ) -> List[Dict[str, str]]:
+        cleaned_combinations = []
+        for combination in combinations:
+            if not combination:
+                raise ValueError("Each required interaction combination must select at least one control value.")
+            cleaned = {}
+            for control_label, value_label in combination.items():
+                control = control_label.strip()
+                value = value_label.strip()
+                if not control or not value:
+                    raise ValueError("Required combinations need non-empty control and value labels.")
+                if len(control) > 200 or len(value) > 500:
+                    raise ValueError("Required combination labels are too long.")
+                cleaned[control] = value
+            cleaned_combinations.append(cleaned)
+        return cleaned_combinations
 
 class QuickScanRequest(BaseModel):
     url: str = Field(..., description="Target website entry URL (e.g. https://example.com)")
@@ -162,6 +205,14 @@ class TestRunResponse(BaseSchema):
     security_score: Optional[float] = None
     performance_score: Optional[float] = None
     accessibility_score: Optional[float] = None
+    llm_provider: Optional[str] = None
+    llm_model: Optional[str] = None
+    llm_call_count: int = 0
+    llm_usage_reported_calls: int = 0
+    llm_prompt_tokens: int = 0
+    llm_completion_tokens: int = 0
+    llm_reasoning_tokens: int = 0
+    llm_total_tokens: int = 0
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     error_message: Optional[str] = None

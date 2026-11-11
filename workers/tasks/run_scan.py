@@ -177,11 +177,20 @@ def _matrix_batch_can_resume(matrix_pages: List[Dict[str, Any]]) -> bool:
     )
     for page in incomplete:
         reason = str(page.get("interruption_reason") or "").lower()
+        discovery_errors = [str(error).lower() for error in page.get("discovery_errors") or []]
+        discovery_errors_are_retryable = all(
+            (
+                error.startswith("could not inspect revealed dropdown ")
+                or error.startswith("could not inspect controls revealed by ")
+            )
+            and "timeout" in error
+            for error in discovery_errors
+        )
         if (
             int(page.get("pending_cases") or 0) <= 0
             or not any(marker in reason for marker in resumable_reasons)
             or not page.get("discovery_complete", True)
-            or page.get("discovery_errors")
+            or (discovery_errors and not discovery_errors_are_retryable)
             or page.get("unsupported_controls")
             or page.get("undiscovered_custom_dropdowns")
             or page.get("resume_manifest_changed")
@@ -192,7 +201,7 @@ def _matrix_batch_can_resume(matrix_pages: List[Dict[str, Any]]) -> bool:
 
 async def _mark_scan_continuing(run_id: str, message: str) -> None:
     from app.common.progress import ScanProgressTracker
-    from app.core.database import AsyncSessionLocal
+    from app.core.worker_database import AsyncSessionLocal
     from app.apps.test_runs.models import TestRun
     from sqlalchemy import select
 
@@ -208,7 +217,7 @@ async def _mark_scan_continuing(run_id: str, message: str) -> None:
 async def _persist_scan_start(run_id: str) -> None:
     """Mark test run as running in the database."""
     try:
-        from app.core.database import AsyncSessionLocal
+        from app.core.worker_database import AsyncSessionLocal
         from app.apps.test_runs.models import TestRun
         from sqlalchemy import select
 
@@ -231,7 +240,7 @@ async def _persist_scan_success(
 ) -> None:
     """Save report summary, artifacts, and mark test run as completed."""
     try:
-        from app.core.database import AsyncSessionLocal
+        from app.core.worker_database import AsyncSessionLocal
         from app.apps.test_runs.models import TestRun, RunArtifact
         from app.apps.reports.services import save_report
         from sqlalchemy import select
@@ -327,7 +336,7 @@ async def _is_cancelled(run_id: str) -> bool:
 async def _persist_scan_failure(run_id: str, error_message: str, is_cancelled: bool = False) -> None:
     """Mark test run as failed or cancelled with diagnostic message."""
     try:
-        from app.core.database import AsyncSessionLocal
+        from app.core.worker_database import AsyncSessionLocal
         from app.apps.test_runs.models import TestRun
         from sqlalchemy import select
 
@@ -342,6 +351,61 @@ async def _persist_scan_failure(run_id: str, error_message: str, is_cancelled: b
                 await db.commit()
     except Exception as e:
         logger.error(f"Failed to persist scan failure for run {run_id}: {e}", exc_info=True)
+
+
+async def _persist_llm_usage(run_id: str, usage: Any) -> None:
+    """Add one Celery batch's provider-reported token usage to its test run."""
+    if not usage.calls:
+        return
+
+    try:
+        from sqlalchemy import func, select, update
+        from app.core.worker_database import AsyncSessionLocal
+        from app.apps.test_runs.models import TestRun
+
+        updates = {
+            "llm_call_count": func.coalesce(TestRun.llm_call_count, 0) + usage.calls,
+            "llm_usage_reported_calls": (
+                func.coalesce(TestRun.llm_usage_reported_calls, 0) + usage.reported_calls
+            ),
+            "llm_prompt_tokens": func.coalesce(TestRun.llm_prompt_tokens, 0) + usage.prompt_tokens,
+            "llm_completion_tokens": (
+                func.coalesce(TestRun.llm_completion_tokens, 0) + usage.completion_tokens
+            ),
+            "llm_reasoning_tokens": (
+                func.coalesce(TestRun.llm_reasoning_tokens, 0) + usage.reasoning_tokens
+            ),
+            "llm_total_tokens": func.coalesce(TestRun.llm_total_tokens, 0) + usage.total_tokens,
+        }
+        if usage.provider:
+            updates["llm_provider"] = usage.provider
+        if usage.model:
+            updates["llm_model"] = usage.model
+
+        async with AsyncSessionLocal() as db:
+            await db.execute(
+                update(TestRun).where(TestRun.id == run_id).values(**updates)
+            )
+            await db.commit()
+            result = await db.execute(select(TestRun).where(TestRun.id == run_id))
+            run = result.scalar_one_or_none()
+
+        if run:
+            usage_message = (
+                f"LLM usage for scan {run_id}: batch {usage.total_tokens} tokens "
+                f"(input {usage.prompt_tokens}, output {usage.completion_tokens}, "
+                f"reasoning {usage.reasoning_tokens}); cumulative {run.llm_total_tokens} tokens "
+                f"(input {run.llm_prompt_tokens}, output {run.llm_completion_tokens}, "
+                f"reasoning {run.llm_reasoning_tokens}) across {run.llm_call_count} calls; "
+                f"provider usage metadata received for {run.llm_usage_reported_calls} calls."
+            )
+            if run.llm_usage_reported_calls < run.llm_call_count:
+                logger.warning(usage_message)
+            else:
+                logger.info(usage_message)
+    except Exception as e:
+        # Token accounting is diagnostic and must not turn a successful scan into a failure.
+        logger.warning("Could not persist LLM token usage for scan %s: %s", run_id, e, exc_info=True)
 
 async def _perform_authentication(page, credentials: Dict[str, Any]) -> None:
     """Pre-flight login routine using supplied credentials."""
@@ -493,7 +557,6 @@ async def _async_execute_scan(
             slow_mo=slow_mo_ms,
         )
         mode_desc = "headless" if headless else "live headed desktop view"
-        await ScanProgressTracker.log(run_id, "INITIALIZING", f"Created isolated Playwright {browser_type} context ({mode_desc}) with ScopeGuard", 10)
         context = await ContextFactory.create_isolated_context(
             browser=browser,
             allowed_domains=set(allowed_domains),
@@ -505,6 +568,12 @@ async def _async_execute_scan(
             record_video_dir=temp_video_dir,
             is_mobile=is_mobile,
             allow_private_hosts=bool(profile.get("allow_private_hosts", False)),
+        )
+        await ScanProgressTracker.log(
+            run_id,
+            "INITIALIZING",
+            f"Created isolated Playwright {browser_type} context ({mode_desc}) with ScopeGuard",
+            10,
         )
         if record_trace:
             await context.tracing.start(screenshots=True, snapshots=True, sources=True)
@@ -553,7 +622,11 @@ async def _async_execute_scan(
             page_url = crawled_page.final_url or crawled_page.url
             if not bool((crawled_page.page_observations or {}).get("interactive_ready", False)):
                 blocked = {
-                    "mode": "exhaustive_cartesian" if exhaustive_interactions else "ai_exploratory",
+                    "mode": (
+                        "pairwise"
+                        if profile.get("interaction_coverage_mode") == "pairwise"
+                        else "exhaustive_cartesian"
+                    ) if exhaustive_interactions else "ai_exploratory",
                     "page_url": redact_url(page_url),
                     "factors_discovered": 0,
                     "planned_cases": 0,
@@ -595,6 +668,13 @@ async def _async_execute_scan(
                     interaction_priority_order=list(profile.get("interaction_priority_order") or [
                         "dropdown", "search", "navigation", "button"
                     ]),
+                    interaction_coverage_mode=str(profile.get("interaction_coverage_mode") or "exhaustive"),
+                    interaction_categories=list(profile.get("interaction_categories") or [
+                        "dropdown", "search", "navigation", "button", "form"
+                    ]),
+                    interaction_required_combinations=list(
+                        profile.get("interaction_required_combinations") or []
+                    ),
                     resume_state=matrix_resume_state,
                     checkpoint_callback=lambda checkpoint: _save_matrix_checkpoint(run_id, page_url, checkpoint),
                     deadline=interaction_deadline,
@@ -722,6 +802,7 @@ async def _async_execute_scan(
                 precomputed_ai_journeys=page_interaction_results,
                 precomputed_combinatorial_results=page_combinatorial_results,
                 exhaustive_interactions=exhaustive_interactions and use_ai,
+                interaction_coverage_mode=str(profile.get("interaction_coverage_mode") or "exhaustive"),
                 skip_ai_journey=bool(use_ai),
             )
             if use_ai and profile.get("ai_explain_failures", True) and func_result.findings:
@@ -870,7 +951,8 @@ async def _async_execute_scan(
             reason_text = " ".join(coverage_reasons[:3]) or "No complete page matrix was recorded."
             coverage_note = (
                 f"Coverage incomplete: {coverage_pending} interaction cases remain pending. {reason_text} "
-                "Review the functional coverage details and adjust the case limit, finite values, or scan timeout before rerunning."
+                "Review functional coverage details; choose pairwise coverage, fewer control categories or values, "
+                "or a longer scan timeout before rerunning."
             )
             report_dict["incomplete"] = True
             report_dict["incomplete_reason"] = coverage_note
@@ -908,6 +990,13 @@ async def _async_execute_scan(
                 await context.close()
             except Exception:
                 pass
+        try:
+            # The Celery entrypoint creates a fresh asyncio loop per task. Stop
+            # Playwright here so BrowserPool never carries loop-bound objects into
+            # the next continuation task handled by this worker process.
+            await BrowserPool.close()
+        except Exception as browser_close_err:
+            logger.warning("Could not close Playwright for scan %s: %s", run_id, browser_close_err)
         if temp_video_dir and os.path.exists(temp_video_dir):
             shutil.rmtree(temp_video_dir, ignore_errors=True)
 
@@ -955,13 +1044,41 @@ async def _execute_with_timeout(
         return {"status": "FAILED", "run_id": run_id, "error": "scan_timeout"}
 
 
+async def _execute_and_record_usage(
+    run_id: str,
+    target_url: str,
+    allowed_domains: List[str],
+    test_pack_yaml: Optional[str],
+    cookies: Optional[List[Dict[str, Any]]],
+    credentials: Optional[Dict[str, Any]],
+    options: Optional[Dict[str, Any]],
+    scan_profile: Optional[Dict[str, Any]],
+    timeout_seconds: int,
+) -> Dict[str, Any]:
+    """Run one scan batch and persist all Gemini/Ollama usage from its calls."""
+    from ai_engine.clients.usage import TokenUsage, begin_token_usage, end_token_usage
+
+    usage = TokenUsage()
+    context_token = begin_token_usage(usage)
+    try:
+        return await _execute_with_timeout(
+            run_id=run_id,
+            target_url=target_url,
+            allowed_domains=allowed_domains,
+            test_pack_yaml=test_pack_yaml,
+            cookies=cookies,
+            credentials=credentials,
+            options=options,
+            scan_profile=scan_profile,
+            timeout_seconds=timeout_seconds,
+        )
+    finally:
+        end_token_usage(context_token)
+        await _persist_llm_usage(run_id, usage)
+
+
 def _persist_worker_failure(run_id: str, message: str) -> None:
     async def persist_in_fresh_loop():
-        try:
-            from app.core.database import engine
-            await engine.dispose()
-        except Exception:
-            pass
         await _persist_scan_failure(run_id, message)
 
     asyncio.run(persist_in_fresh_loop())
@@ -1017,17 +1134,6 @@ def execute_website_scan(
             pass
     logger.info(f"Starting automated scan task for run {run_id} on {redact_url(target_url)}")
 
-    # Dispose the async engine's connection pool before creating a new event loop.
-    # asyncpg connections are bound to the event loop they were created in; pooled
-    # connections from a previous task's loop become invalid once that loop is closed,
-    # causing "Event loop is closed" / "Future attached to a different loop" errors.
-    try:
-        from app.core.database import engine as _async_engine
-        import asyncio as _asyncio
-        _asyncio.run(_async_engine.dispose())
-    except Exception as _e:
-        logger.debug(f"Engine dispose skipped: {_e}")
-
     if asyncio.run(_is_cancelled(run_id)):
         asyncio.run(_persist_cancelled_and_clear_checkpoints(run_id))
         return {"status": "CANCELLED", "run_id": run_id}
@@ -1036,7 +1142,7 @@ def execute_website_scan(
     # Allow at least 300s (5 minutes) so that crawler + multi-step AI ReAct journey can complete
     raw_timeout = int(effective_profile.get("timeout_seconds") or 300)
     timeout_seconds = max(300, raw_timeout)
-    result = asyncio.run(_execute_with_timeout(
+    result = asyncio.run(_execute_and_record_usage(
         run_id=run_id,
         target_url=target_url,
         allowed_domains=allowed_domains,

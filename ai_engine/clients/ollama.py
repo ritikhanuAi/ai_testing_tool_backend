@@ -1,6 +1,7 @@
 import httpx
 from typing import List, Optional
 from ai_engine.clients.base import BaseLLMClient
+from ai_engine.clients.usage import record_token_usage
 from ai_engine.config import ai_config
 
 class OllamaClient(BaseLLMClient):
@@ -11,6 +12,19 @@ class OllamaClient(BaseLLMClient):
         self.model = model or ai_config.ollama_model
         self.vision_model = ai_config.ollama_vision_model
         self.timeout = ai_config.timeout_seconds
+        self.provider = "ollama"
+
+    def _record_usage(self, data: dict, model: str) -> None:
+        prompt_tokens = data.get("prompt_eval_count")
+        completion_tokens = data.get("eval_count")
+        usage = {}
+        if prompt_tokens is not None:
+            usage["prompt_tokens"] = prompt_tokens
+        if completion_tokens is not None:
+            usage["completion_tokens"] = completion_tokens
+        if prompt_tokens is not None or completion_tokens is not None:
+            usage["total_tokens"] = (prompt_tokens or 0) + (completion_tokens or 0)
+        record_token_usage(usage, provider=self.provider, model=model)
 
     async def is_available(self) -> bool:
         """Check if Ollama server is responding."""
@@ -35,6 +49,7 @@ class OllamaClient(BaseLLMClient):
             res = await client.post(f"{self.base_url}/api/generate", json=payload)
             res.raise_for_status()
             data = res.json()
+            self._record_usage(data, self.model)
             return data.get("response", "")
 
     async def generate_with_vision(
@@ -59,6 +74,7 @@ class OllamaClient(BaseLLMClient):
             res = await client.post(f"{self.base_url}/api/chat", json=payload)
             res.raise_for_status()
             data = res.json()
+            self._record_usage(data, self.vision_model)
             content = data.get("message", {}).get("content", "")
             if not content.strip():
                 raise ValueError("Ollama vision model returned an empty response")
