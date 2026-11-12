@@ -5,6 +5,7 @@ operation, not a long-lived Celery worker process.
 """
 import json
 import logging
+import re
 import time
 from typing import Optional
 from urllib.parse import urlparse
@@ -281,6 +282,111 @@ def _infer_name_from_url(url: str) -> str:
     return segment.replace("-", " ").replace("_", " ").title() or "Page"
 
 
+async def _looks_like_login_page(page) -> bool:
+    """
+    A page is treated as a login page whenever it shows a visible password
+    input. URL path is deliberately ignored — many SPAs host the login form
+    at /, /welcome, or a non-obvious route.
+    """
+    try:
+        loc = page.locator('input[type="password"]').first
+        if await loc.count() == 0:
+            return False
+        return bool(await loc.is_visible())
+    except Exception:
+        return False
+
+
+_DETAIL_ID_SEGMENT = re.compile(
+    r"/(\d+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/?$",
+    re.IGNORECASE,
+)
+
+
+def _collapse_detail_duplicates(modules: list[dict]) -> list[dict]:
+    """
+    Collapse repetitive detail-page entries like 20 rows of "View" at
+    /jobs/39/, /jobs/40/, /jobs/41/, ... — common pattern on list pages
+    where each table row has an identically-named link to a different record.
+
+    Rule: when 3+ modules share the same (lowercase name, parent path), keep the
+    first as a representative detail page (renamed to show it's a sample) and
+    drop the rest. If the parent list page isn't already a module, add it.
+    """
+    from collections import defaultdict
+    from urllib.parse import urlparse, urlunparse
+
+    def parent_of(url: str) -> Optional[str]:
+        path = urlparse(url).path
+        stripped = _DETAIL_ID_SEGMENT.sub("/", path)
+        if stripped == path or not stripped or stripped == "/":
+            return None
+        return stripped
+
+    groups: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for idx, m in enumerate(modules):
+        name = (m.get("name") or "").strip()
+        if not name:
+            continue
+        parent = parent_of(m["url"])
+        if parent:
+            groups[(name.lower(), parent)].append(idx)
+
+    existing_paths = {urlparse(m["url"]).path.rstrip("/") for m in modules}
+
+    to_drop: set[int] = set()
+    replacements: dict[int, dict] = {}
+    to_add: list[dict] = []
+    collapsed_groups = 0
+
+    for (_name_lc, parent_path), indices in groups.items():
+        if len(indices) < 3:
+            continue
+        collapsed_groups += 1
+        to_drop.update(indices[1:])
+
+        parent_key = parent_path.rstrip("/")
+        parent_segment = parent_key.rsplit("/", 1)[-1] if parent_key else ""
+        parent_label = (
+            parent_segment.replace("-", " ").replace("_", " ").title()
+            if parent_segment
+            else ""
+        )
+
+        rep = dict(modules[indices[0]])
+        orig_name = rep["name"]
+        if parent_label and parent_label.lower() not in orig_name.lower():
+            rep["name"] = f"{parent_label}: {orig_name} (1 of {len(indices)})"
+        else:
+            rep["name"] = f"{orig_name} (1 of {len(indices)})"
+        replacements[indices[0]] = rep
+
+        if parent_key and parent_key not in existing_paths:
+            parsed = urlparse(modules[indices[0]]["url"])
+            parent_url = urlunparse(parsed._replace(path=parent_path, query="", fragment=""))
+            to_add.append({
+                "name": parent_label or _infer_name_from_url(parent_url),
+                "url": parent_url,
+                "depth": max(0, rep.get("depth", 1) - 1),
+            })
+            existing_paths.add(parent_key)
+
+    if collapsed_groups:
+        logger.info(
+            "Module discovery: collapsed %d detail-duplicate group(s), removed %d entries",
+            collapsed_groups,
+            len(to_drop),
+        )
+
+    result: list[dict] = []
+    for i, m in enumerate(modules):
+        if i in to_drop:
+            continue
+        result.append(replacements.get(i, m))
+    result.extend(to_add)
+    return result
+
+
 async def _generate_goals_for_modules(modules: list[dict]) -> dict[str, str]:
     """ONE batched LLM call to generate test goals for all discovered modules."""
     if not modules:
@@ -530,7 +636,8 @@ async def discover_site_modules(request_data: DiscoverModulesRequest) -> Discove
 
         await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
 
-        if request_data.credentials and request_data.credentials.enabled:
+        auth_requested = bool(request_data.credentials and request_data.credentials.enabled)
+        if auth_requested:
             await _login_for_discovery(page, request_data.credentials)
 
         # Wait for the page to settle after login (SPA sidebar renders after JS hydration)
@@ -539,6 +646,33 @@ async def discover_site_modules(request_data: DiscoverModulesRequest) -> Discove
         except Exception:
             pass
         await page.wait_for_timeout(1500)
+
+        # Recovery: SPAs often briefly navigate to a protected route after login,
+        # then an async auth check fails and bounces back to /login. Detect this
+        # and try one re-navigation to the user-supplied entry URL.
+        if auth_requested and await _looks_like_login_page(page):
+            logger.warning(
+                "Module discovery: still on login-like page after auth (%s); "
+                "retrying by navigating to %s",
+                page.url, target_url,
+            )
+            try:
+                await page.goto(target_url, wait_until="domcontentloaded", timeout=20000)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=6000)
+                except Exception:
+                    pass
+                await page.wait_for_timeout(1500)
+            except Exception as e:
+                logger.warning("Module discovery: recovery navigation failed: %s", e)
+
+            if await _looks_like_login_page(page):
+                logger.warning(
+                    "Module discovery: still on login page after recovery (%s). "
+                    "Credentials may be wrong or the SPA requires extra auth steps — "
+                    "module list will reflect only what the login page exposes.",
+                    page.url,
+                )
 
         post_login_url = page.url
         logger.info("Module discovery: post-login URL = %s", post_login_url)
@@ -682,6 +816,9 @@ async def discover_site_modules(request_data: DiscoverModulesRequest) -> Discove
                     logger.debug("Sub-module discovery failed for %s: %s", module_url, e)
 
             logger.info("Module discovery: after sub-page scan, total modules = %d", len(deduped))
+
+        # Collapse repetitive detail-page entries (e.g. 20 rows of "View" at /jobs/39/, /jobs/40/, ...)
+        deduped = _collapse_detail_duplicates(deduped)
 
         goals_map = await _generate_goals_for_modules(deduped)
         elapsed_ms = round((time.perf_counter() - start) * 1000, 1)

@@ -152,6 +152,11 @@ async def dispatch_quick_scan(db: AsyncSession, request_data: QuickScanRequest) 
         "max_ai_cases": int(options_dict.get("max_ai_cases") or 5),
         "max_crawl_depth": int(options_dict.get("max_crawl_depth", 2)),
         "include_sitemap_urls": bool(options_dict.get("include_sitemap_urls", False)),
+        "max_pages": int(options_dict.get("max_pages", 100)),
+        "traversal_strategy": options_dict.get("traversal_strategy", "bfs"),
+        "explore_button_navigations": bool(options_dict.get("explore_button_navigations", False)),
+        "continue_on_incomplete_coverage": bool(options_dict.get("continue_on_incomplete_coverage", True)),
+        "per_page_time_budget_seconds": int(options_dict.get("per_page_time_budget_seconds", 0)),
     }
 
     # 5. Create TestRun record
@@ -373,6 +378,11 @@ async def dispatch_custom_scan(db: AsyncSession, request_data: CustomScanRequest
         "viewport_height": scan_profile.viewport_height,
         "headless": options_dict.get("headless", True),
         "slow_mo_ms": options_dict.get("slow_mo_ms", 0),
+        "max_pages": int(options_dict.get("max_pages", 100)),
+        "traversal_strategy": options_dict.get("traversal_strategy", "bfs"),
+        "explore_button_navigations": bool(options_dict.get("explore_button_navigations", False)),
+        "continue_on_incomplete_coverage": bool(options_dict.get("continue_on_incomplete_coverage", True)),
+        "per_page_time_budget_seconds": int(options_dict.get("per_page_time_budget_seconds", 0)),
     }
 
     # 6. Create TestRun record
@@ -455,6 +465,11 @@ async def dispatch_scan_run(db: AsyncSession, request_data: TriggerScanRequest) 
             "browser_type": profile.browser_type,
             "viewport_width": profile.viewport_width,
             "viewport_height": profile.viewport_height,
+            "max_pages": 100,
+            "traversal_strategy": "bfs",
+            "explore_button_navigations": False,
+            "continue_on_incomplete_coverage": True,
+            "per_page_time_budget_seconds": 0,
         }
     else:
         profile_payload = {
@@ -468,6 +483,11 @@ async def dispatch_scan_run(db: AsyncSession, request_data: TriggerScanRequest) 
             "browser_type": "chromium",
             "viewport_width": 1280,
             "viewport_height": 720,
+            "max_pages": 100,
+            "traversal_strategy": "bfs",
+            "explore_button_navigations": False,
+            "continue_on_incomplete_coverage": True,
+            "per_page_time_budget_seconds": 0,
         }
 
     if not any(profile_payload[key] for key in (
@@ -513,6 +533,11 @@ async def dispatch_scan_run(db: AsyncSession, request_data: TriggerScanRequest) 
     if options_dict:
         profile_payload["headless"] = options_dict.get("headless", True)
         profile_payload["slow_mo_ms"] = options_dict.get("slow_mo_ms", 0)
+        profile_payload["max_pages"] = int(options_dict.get("max_pages", profile_payload.get("max_pages", 100)))
+        profile_payload["traversal_strategy"] = options_dict.get("traversal_strategy", profile_payload.get("traversal_strategy", "bfs"))
+        profile_payload["explore_button_navigations"] = bool(options_dict.get("explore_button_navigations", profile_payload.get("explore_button_navigations", False)))
+        profile_payload["continue_on_incomplete_coverage"] = bool(options_dict.get("continue_on_incomplete_coverage", profile_payload.get("continue_on_incomplete_coverage", True)))
+        profile_payload["per_page_time_budget_seconds"] = int(options_dict.get("per_page_time_budget_seconds", profile_payload.get("per_page_time_budget_seconds", 0)))
 
     try:
         from workers.tasks.run_scan import execute_website_scan

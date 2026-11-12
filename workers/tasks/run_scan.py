@@ -407,34 +407,134 @@ async def _persist_llm_usage(run_id: str, usage: Any) -> None:
         # Token accounting is diagnostic and must not turn a successful scan into a failure.
         logger.warning("Could not persist LLM token usage for scan %s: %s", run_id, e, exc_info=True)
 
-async def _perform_authentication(page, credentials: Dict[str, Any]) -> None:
-    """Pre-flight login routine using supplied credentials."""
+async def _looks_like_login_page(page) -> bool:
+    """
+    A page is treated as a login page whenever it shows a visible password
+    input. URL path is deliberately ignored — many SPAs host the login form
+    at /, /welcome, or a non-obvious route. A visible password input is the
+    authoritative signal that submitting a form here would attempt a sign-in.
+    """
+    try:
+        loc = page.locator('input[type="password"]').first
+        if await loc.count() == 0:
+            return False
+        return bool(await loc.is_visible())
+    except Exception:
+        return False
+
+
+async def _perform_authentication(page, credentials: Dict[str, Any]) -> bool:
+    """
+    Pre-flight login routine using supplied credentials.
+    Returns True if URL changed after submit (login likely succeeded).
+    """
     login_url = credentials.get("login_url")
-    username = credentials.get("username")
-    password = credentials.get("password")
+    username = credentials.get("username") or ""
+    password = credentials.get("password") or ""
     if not (login_url or username or password):
-        return
+        return False
 
     try:
-        if login_url:
+        current_url = page.url
+        if login_url and login_url.rstrip("/") != current_url.rstrip("/"):
             await page.goto(login_url, wait_until="domcontentloaded", timeout=25000)
+            await page.wait_for_timeout(1000)
 
+        # Fill username — try progressively broader selectors
+        username_selectors = [
+            'input[type="email"]',
+            'input[name="username"]',
+            'input[name="user"]',
+            'input[id="username"]',
+            'input[name*="email"]',
+            'input[id*="email"]',
+            'input[id*="user"]',
+            'input[type="text"]',  # generic text fallback
+        ]
+        filled_user = False
         if username:
-            user_input = page.locator('input[type="email"], input[name*="user"], input[name*="email"], input[id*="user"], input[id*="email"]').first
-            if await user_input.count() > 0:
-                await user_input.fill(username)
+            for sel in username_selectors:
+                try:
+                    loc = page.locator(sel).first
+                    if await loc.count() > 0 and await loc.is_visible():
+                        await loc.fill(username)
+                        filled_user = True
+                        logger.info("Authentication: filled username with selector %r", sel)
+                        break
+                except Exception:
+                    continue
 
+        # Fill password
+        filled_pass = False
         if password:
-            pass_input = page.locator('input[type="password"]').first
-            if await pass_input.count() > 0:
-                await pass_input.fill(password)
+            try:
+                pass_loc = page.locator('input[type="password"]').first
+                if await pass_loc.count() > 0:
+                    await pass_loc.fill(password)
+                    filled_pass = True
+            except Exception:
+                pass
 
-        submit_btn = page.locator('button[type="submit"], input[type="submit"], button:has-text("Login"), button:has-text("Sign in")').first
-        if await submit_btn.count() > 0:
-            await submit_btn.click()
-            await page.wait_for_timeout(2000)
+        if username and not filled_user:
+            logger.warning("Authentication: could not locate username field")
+        if password and not filled_pass:
+            logger.warning("Authentication: could not locate password field")
+
+        before_url = page.url
+
+        # Click submit — try multiple strategies
+        submit_selectors = [
+            'button[type="submit"]',
+            'input[type="submit"]',
+            'button:has-text("Login")',
+            'button:has-text("Sign in")',
+            'button:has-text("Log in")',
+            'button:has-text("Submit")',
+        ]
+        clicked = False
+        for sel in submit_selectors:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() > 0 and await loc.is_visible():
+                    await loc.click()
+                    clicked = True
+                    logger.info("Authentication: clicked submit with selector %r", sel)
+                    break
+            except Exception:
+                continue
+
+        if not clicked:
+            logger.warning("Authentication: no submit button found, trying Enter key")
+            try:
+                await page.keyboard.press("Enter")
+                clicked = True
+            except Exception:
+                pass
+
+        if clicked:
+            try:
+                await page.wait_for_url(
+                    lambda url: url.rstrip("/") != before_url.rstrip("/"),
+                    timeout=10000,
+                )
+                logger.info("Authentication: URL changed to %s", page.url)
+            except Exception:
+                logger.warning("Authentication: URL did not change after submit (still %s)", page.url)
+
+        # Extra wait for SPA to settle
+        try:
+            await page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
+        await page.wait_for_timeout(1500)
+
+        success = page.url.rstrip("/") != before_url.rstrip("/")
+        logger.info("Authentication: success=%s final_url=%s", success, page.url)
+        return success
+
     except Exception as auth_err:
-        logger.warning(f"Authentication flow encountered non-fatal error: {auth_err}")
+        logger.warning("Authentication flow encountered non-fatal error: %s", auth_err)
+        return False
 
 async def _discover_and_generate_ai_tests(page, options: Dict[str, Any]) -> List[Any]:
     """Inspect page landmarks and generate structured test cases via LLM."""
@@ -587,9 +687,48 @@ async def _async_execute_scan(
             await page.set_viewport_size({"width": profile["viewport_width"], "height": profile["viewport_height"]})
 
         # Pre-flight authentication if credentials supplied
+        authenticated = False
         if creds:
             await ScanProgressTracker.log(run_id, "AUTHENTICATING", f"Executing authentication flow on {creds.get('login_url', target_url)}", 12)
-            await _perform_authentication(page, creds)
+            auth_result = await _perform_authentication(page, creds)
+            authenticated = bool(auth_result) and not await _looks_like_login_page(page)
+
+            # Recovery: SPAs often briefly navigate to a protected route after login,
+            # then an async auth check fails and bounces back to /login. Detect this
+            # and try one re-navigation to the user-supplied target URL.
+            if await _looks_like_login_page(page):
+                logger.warning(
+                    "Authentication: still on login-like page after auth (%s); "
+                    "retrying by navigating to %s",
+                    page.url, target_url,
+                )
+                try:
+                    await page.goto(target_url, wait_until="domcontentloaded", timeout=20000)
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=6000)
+                    except Exception:
+                        pass
+                    await page.wait_for_timeout(1500)
+                except Exception as e:
+                    logger.warning("Authentication: recovery navigation failed: %s", e)
+
+                if await _looks_like_login_page(page):
+                    logger.warning(
+                        "Authentication: still on login page after recovery (%s). "
+                        "Credentials may be wrong or the SPA requires extra auth steps — "
+                        "scan will only cover pages reachable without login.",
+                        page.url,
+                    )
+                    await ScanProgressTracker.log(
+                        run_id,
+                        "AUTHENTICATING",
+                        "Login did not persist — SPA bounced back to login page. Scan will cover only public pages.",
+                        15,
+                    )
+                else:
+                    # Recovery navigation succeeded — session is active.
+                    authenticated = True
+
             # After login the app may redirect to its default landing page (e.g. /home).
             # Navigate back to the requested target module before crawling.
             if page.url.rstrip("/") != target_url.rstrip("/"):
@@ -605,7 +744,7 @@ async def _async_execute_scan(
         crawl_depth = int(profile.get("max_crawl_depth", 5))
         # depth=0 means scan only the target page itself (no link following).
         # depth=1 means target + its direct children. Keeps module scans focused.
-        crawl_max_pages = 1 if crawl_depth == 0 else 100
+        crawl_max_pages = 1 if crawl_depth == 0 else int(profile.get("max_pages", 100))
         human_mode = bool(test_pack_yaml)
         use_ai = not human_mode
         page_interaction_results: List[Dict[str, Any]] = []
@@ -614,6 +753,7 @@ async def _async_execute_scan(
         exhaustive_interactions = bool(profile.get("exhaustive_interactions", True))
         crawl_budget_seconds = max(5, int(profile["timeout_seconds"] * 0.85))
         interaction_deadline = time.monotonic() + crawl_budget_seconds
+        per_page_time_budget = int(profile.get("per_page_time_budget_seconds") or 0)
 
         async def explore_page_before_following_links(browser_page, crawled_page):
             """Complete this page's safe interaction pass before the crawler follows its links."""
@@ -652,6 +792,48 @@ async def _async_execute_scan(
                         "findings": [], "history": [], "visual_paths": [], "page_url": redact_url(page_url),
                     })
                 return False
+            # When we have a valid authenticated session, do not run interaction
+            # tests on login pages — the matrix would fill the form with dummy
+            # values and submit, which the backend rejects and often rotates the
+            # session cookie, logging us out for the rest of the scan.
+            if authenticated and await _looks_like_login_page(browser_page):
+                skipped_record = {
+                    "mode": (
+                        "pairwise"
+                        if profile.get("interaction_coverage_mode") == "pairwise"
+                        else "exhaustive_cartesian"
+                    ) if exhaustive_interactions else "ai_exploratory",
+                    "page_url": redact_url(page_url),
+                    "factors_discovered": 0,
+                    "planned_cases": 0,
+                    "executed_cases": 0,
+                    "passed_cases": 0,
+                    "failed_cases": 0,
+                    "blocked_cases": 0,
+                    "pending_cases": 0,
+                    "case_limit": int(profile.get("max_generated_cases") or 1000),
+                    "limit_exceeded": False,
+                    "action_order_permutations": bool(profile.get("include_action_order_permutations", False)),
+                    "complete": True,
+                    "interruption_reason": "Login form skipped to preserve the authenticated session — submitting dummy credentials would log the crawler out.",
+                    "test_cases": [],
+                }
+                if exhaustive_interactions:
+                    page_combinatorial_results.append(skipped_record)
+                else:
+                    page_interaction_results.append({
+                        "actions": 0, "completed": True, "counted": False, "passed": True,
+                        "findings": [], "history": [], "visual_paths": [],
+                        "page_url": redact_url(page_url),
+                    })
+                await ScanProgressTracker.log(
+                    run_id,
+                    "FUNCTIONAL",
+                    f"Skipped login-form interactions on {redact_url(page_url)} to preserve the authenticated session.",
+                    20,
+                )
+                return True
+
             await ScanProgressTracker.log(
                 run_id,
                 "FUNCTIONAL",
@@ -679,7 +861,11 @@ async def _async_execute_scan(
                     ),
                     resume_state=matrix_resume_state,
                     checkpoint_callback=lambda checkpoint: _save_matrix_checkpoint(run_id, page_url, checkpoint),
-                    deadline=interaction_deadline,
+                    deadline=(
+                        min(interaction_deadline, time.monotonic() + per_page_time_budget)
+                        if per_page_time_budget > 0
+                        else interaction_deadline
+                    ),
                     cancellation_check=lambda: _is_cancelled(run_id),
                 )
                 matrix["page_url"] = redact_url(page_url)
@@ -726,6 +912,10 @@ async def _async_execute_scan(
             timeout_seconds=crawl_budget_seconds,
             request_rate_limit=int(profile["rate_limit"]),
             include_sitemap_urls=bool(profile.get("include_sitemap_urls", False)),
+            traversal_strategy=str(profile.get("traversal_strategy", "bfs")),
+            explore_button_navigations=bool(profile.get("explore_button_navigations", False)),
+            allow_state_changing=bool(profile.get("allow_state_changing", False)),
+            continue_on_incomplete_coverage=bool(profile.get("continue_on_incomplete_coverage", True)),
             page_callback=explore_page_before_following_links,
             cancellation_check=lambda: _is_cancelled(run_id),
         )

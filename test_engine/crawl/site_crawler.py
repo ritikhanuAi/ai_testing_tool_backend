@@ -16,6 +16,10 @@ _SIDE_EFFECT_PATH = re.compile(
     r"(?:^|/)(?:logout|log-out|signout|sign-out|delete|remove|unsubscribe|checkout|purchase|payment|pay|transfer|publish|send)(?:/|$)",
     re.IGNORECASE,
 )
+_DESTRUCTIVE_BUTTON_NAME = re.compile(
+    r"\b(?:delete|remove|logout|log\s?out|sign\s?out|purge|cancel|submit|pay|charge|buy|confirm|save|publish|unsubscribe|download)\b",
+    re.IGNORECASE,
+)
 _SIDE_EFFECT_QUERY_KEYS = {
     "action", "confirm", "delete", "logout", "signout", "unsubscribe", "purchase", "checkout",
 }
@@ -96,6 +100,10 @@ class CrawlResult(BaseModel):
     request_rate_limit: int = 10
     timeout_seconds_limit: int = 300
     elapsed_seconds: float = 0.0
+    traversal_strategy: str = "bfs"
+    button_navigation_exploration: bool = False
+    button_discovered_url_count: int = 0
+    continue_on_incomplete_coverage: bool = True
 
     def report_summary(self) -> Dict[str, Any]:
         summary = self.model_dump(exclude={"pages"})
@@ -286,6 +294,111 @@ class SiteCrawler:
             return None, "unsafe"
 
     @classmethod
+    async def _discover_button_navigations(
+        cls,
+        page: Page,
+        *,
+        allow_state_changing: bool,
+        deadline: float,
+        max_clicks: int = 8,
+        click_budget_seconds: float = 10.0,
+    ) -> List[str]:
+        """Click safe-looking disclosure/view buttons and record URLs reached by same-tab navigation.
+
+        Popups and new tabs are picked up by the caller's context-level ``on('page')``
+        listener. SPA route changes land in ``window.__crawlerDiscoveredRoutes``. This
+        helper only captures hard navigations that happen inside the current tab.
+        """
+        try:
+            candidates = await page.evaluate(
+                """() => {
+                    const list = [];
+                    const nodes = Array.from(document.querySelectorAll(
+                        'button, [role="button"], a[role="button"], summary, [aria-haspopup]'
+                    )).slice(0, 80);
+                    let idx = 0;
+                    for (const node of nodes) {
+                        if (!(node instanceof Element)) continue;
+                        const rect = node.getBoundingClientRect ? node.getBoundingClientRect() : {width: 0, height: 0};
+                        if (!rect.width || !rect.height) continue;
+                        if (node.closest('[aria-hidden="true"]')) continue;
+                        if (node.getAttribute && node.getAttribute('aria-disabled') === 'true') continue;
+                        if (node.disabled) continue;
+                        const name = (
+                            (node.getAttribute && node.getAttribute('aria-label')) ||
+                            node.innerText || node.textContent || ''
+                        ).trim().slice(0, 120);
+                        if (!name) continue;
+                        node.setAttribute('data-crawler-trigger', String(idx));
+                        list.push({name, idx});
+                        idx += 1;
+                        if (list.length >= 16) break;
+                    }
+                    return list;
+                }"""
+            )
+        except Exception:
+            return []
+
+        safe: List[Dict[str, Any]] = []
+        for candidate in (candidates or []):
+            if not isinstance(candidate, dict):
+                continue
+            name = (candidate.get("name") or "").strip()
+            if not name:
+                continue
+            if not allow_state_changing and _DESTRUCTIVE_BUTTON_NAME.search(name):
+                continue
+            safe.append(candidate)
+            if len(safe) >= max_clicks:
+                break
+
+        discovered: List[str] = []
+        click_started = time.monotonic()
+        for candidate in safe:
+            if time.monotonic() - click_started > click_budget_seconds:
+                break
+            if time.monotonic() >= deadline:
+                break
+            idx = candidate.get("idx")
+            if idx is None:
+                continue
+            selector = f'[data-crawler-trigger="{idx}"]'
+            try:
+                locator = page.locator(selector).first
+                if await locator.count() == 0:
+                    continue
+            except Exception:
+                continue
+            url_before = page.url
+            try:
+                await locator.click(timeout=2000, no_wait_after=True)
+            except Exception:
+                continue
+            try:
+                await asyncio.sleep(0.4)
+            except Exception:
+                pass
+            url_after = page.url or ""
+            if url_after and url_after != url_before:
+                discovered.append(url_after)
+                # Click caused a hard-nav; remaining markers are gone, stop.
+                try:
+                    await page.go_back(wait_until="domcontentloaded", timeout=5000)
+                except Exception:
+                    pass
+                break
+
+        try:
+            await page.evaluate(
+                "() => { document.querySelectorAll('[data-crawler-trigger]').forEach(n => n.removeAttribute('data-crawler-trigger')); }"
+            )
+        except Exception:
+            pass
+
+        return discovered
+
+    @classmethod
     async def crawl(
         cls,
         page: Page,
@@ -298,10 +411,14 @@ class SiteCrawler:
         max_links_per_page: int = MAX_LINKS_PER_PAGE,
         request_rate_limit: int = 10,
         include_sitemap_urls: bool = True,
+        traversal_strategy: str = "bfs",
+        explore_button_navigations: bool = False,
+        allow_state_changing: bool = False,
+        continue_on_incomplete_coverage: bool = True,
         page_callback: Optional[Callable[[Page, CrawledPage], Awaitable[Optional[bool]]]] = None,
         cancellation_check: Optional[Callable[[], Awaitable[bool]]] = None,
     ) -> CrawlResult:
-        """Visit pages breadth-first within explicit page, depth, time, and host limits."""
+        """Visit pages breadth-first or depth-first within explicit page, depth, time, and host limits."""
         if max_pages < 1 or max_depth < 0 or timeout_seconds < 1 or max_links_per_page < 1:
             raise ValueError("Crawl limits must be positive (depth may be zero)")
         try:
@@ -313,6 +430,9 @@ class SiteCrawler:
             raise ValueError("The starting URL is not a safe in-scope HTTP(S) URL")
 
         started = time.monotonic()
+        traversal_strategy = (traversal_strategy or "bfs").lower()
+        if traversal_strategy not in ("bfs", "dfs"):
+            traversal_strategy = "bfs"
         result = CrawlResult(
             start_url=start,
             max_pages_limit=max_pages,
@@ -320,8 +440,12 @@ class SiteCrawler:
             max_links_per_page_limit=min(max_links_per_page, cls.MAX_LINKS_PER_PAGE),
             request_rate_limit=max(request_rate_limit, 1),
             timeout_seconds_limit=timeout_seconds,
+            traversal_strategy=traversal_strategy,
+            button_navigation_exploration=bool(explore_button_navigations),
+            continue_on_incomplete_coverage=bool(continue_on_incomplete_coverage),
         )
         queue = deque([(start, 0)])
+        pop_from_queue = queue.pop if traversal_strategy == "dfs" else queue.popleft
         enqueued: Set[str] = {start}
         visited: Set[str] = set()
         depth_limited: Set[str] = set()
@@ -367,7 +491,7 @@ class SiteCrawler:
                 if elapsed >= timeout_seconds:
                     result.truncated_by_timeout = True
                     break
-                current_url, depth = queue.popleft()
+                current_url, depth = pop_from_queue()
                 if current_url in visited:
                     continue
                 visited.add(current_url)
@@ -386,6 +510,10 @@ class SiteCrawler:
                 failed_request_count = [0]
                 failed_request_urls: List[str] = []
                 failed_resource_statuses: List[int] = []
+                captured_popup_urls: List[str] = []
+                pending_popup_tasks: List[asyncio.Task] = []
+                button_navigation_urls: List[str] = []
+                spa_routes: List[str] = []
 
                 def on_page_error(error: Exception) -> None:
                     js_error_count[0] += 1
@@ -411,10 +539,34 @@ class SiteCrawler:
                     if cls._host_is_allowed(hostname, allowed_domains) and len(failed_resource_statuses) < 20:
                         failed_resource_statuses.append(response.status)
 
+                async def _record_and_close_popup(popup_page) -> None:
+                    try:
+                        await popup_page.wait_for_load_state("domcontentloaded", timeout=3000)
+                    except Exception:
+                        pass
+                    try:
+                        if popup_page.url:
+                            captured_popup_urls.append(popup_page.url)
+                    except Exception:
+                        pass
+                    try:
+                        await popup_page.close()
+                    except Exception:
+                        pass
+
+                def on_new_page(new_page) -> None:
+                    if new_page is page:
+                        return
+                    try:
+                        pending_popup_tasks.append(asyncio.create_task(_record_and_close_popup(new_page)))
+                    except Exception:
+                        pass
+
                 page.on("pageerror", on_page_error)
                 page.on("console", on_console)
                 page.on("requestfailed", on_request_failed)
                 page.on("response", on_response)
+                page.context.on("page", on_new_page)
                 try:
                     remaining_ms = max(1, int((timeout_seconds - (time.monotonic() - started)) * 1000))
                     response = await page.goto(
@@ -437,6 +589,29 @@ class SiteCrawler:
                             pass
                     remaining_ms = max(1, int((timeout_seconds - (time.monotonic() - started)) * 1000))
                     interactive_ready = await wait_for_page_ready(page, timeout_ms=min(12000, remaining_ms))
+                    # Install an SPA route hook so history.pushState / replaceState / popstate
+                    # route changes are observable without a real navigation event.
+                    try:
+                        await page.evaluate(
+                            """() => {
+                                if (window.__crawlerHistoryHook) return;
+                                window.__crawlerHistoryHook = true;
+                                window.__crawlerDiscoveredRoutes = [];
+                                const _push = history.pushState;
+                                const _replace = history.replaceState;
+                                history.pushState = function () {
+                                    try { _push.apply(this, arguments); window.__crawlerDiscoveredRoutes.push(location.href); } catch (e) {}
+                                };
+                                history.replaceState = function () {
+                                    try { _replace.apply(this, arguments); window.__crawlerDiscoveredRoutes.push(location.href); } catch (e) {}
+                                };
+                                window.addEventListener('popstate', () => {
+                                    try { window.__crawlerDiscoveredRoutes.push(location.href); } catch (e) {}
+                                });
+                            }"""
+                        )
+                    except Exception:
+                        pass
                     eval_result = await page.evaluate(
                         """() => ({
                             links: Array.from(document.querySelectorAll('a[href]'))
@@ -482,6 +657,24 @@ class SiteCrawler:
                         "domain": item.get("domain", ""),
                         "path": item.get("path", "/"),
                     } for item in raw_cookies]
+                    if explore_button_navigations:
+                        remaining_seconds = timeout_seconds - (time.monotonic() - started)
+                        if remaining_seconds > 2.0:
+                            button_navigation_urls = await cls._discover_button_navigations(
+                                page,
+                                allow_state_changing=allow_state_changing,
+                                deadline=started + timeout_seconds,
+                            )
+                        try:
+                            raw_routes = await page.evaluate(
+                                "() => { const r = Array.isArray(window.__crawlerDiscoveredRoutes) ? "
+                                "window.__crawlerDiscoveredRoutes.slice() : []; "
+                                "window.__crawlerDiscoveredRoutes = []; return r; }"
+                            )
+                            if isinstance(raw_routes, list):
+                                spa_routes = [str(route) for route in raw_routes if route]
+                        except Exception:
+                            spa_routes = []
                     final_url = page.url
                 except Exception as error:
                     links, cookies = [], []
@@ -494,6 +687,26 @@ class SiteCrawler:
                     page.remove_listener("console", on_console)
                     page.remove_listener("requestfailed", on_request_failed)
                     page.remove_listener("response", on_response)
+                    try:
+                        page.context.remove_listener("page", on_new_page)
+                    except Exception:
+                        pass
+                    if pending_popup_tasks:
+                        try:
+                            await asyncio.wait(pending_popup_tasks, timeout=2.0)
+                        except Exception:
+                            pass
+
+                # If the request redirected to a different URL (e.g. "/" → "/dashboard/home"),
+                # mark the final URL as already visited so re-discovering it as a link elsewhere
+                # does not cause the pillar to run its matrix on the same page twice.
+                if final_url and final_url != current_url:
+                    normalized_final, final_classification = cls._normalize_link(
+                        final_url, final_url, allowed_domains, start_port
+                    )
+                    if normalized_final and final_classification != "unsafe" and final_classification != "out_of_scope":
+                        visited.add(normalized_final)
+                        enqueued.add(normalized_final)
 
                 normalized_links: List[str] = []
                 if isinstance(observations, dict):
@@ -515,6 +728,40 @@ class SiteCrawler:
                             else:
                                 depth_limited.add(link)
 
+                button_discovered_total = 0
+                discovery_sources = captured_popup_urls + spa_routes + button_navigation_urls
+                seen_discovery: Set[str] = set()
+                for href in discovery_sources:
+                    if not href or href in seen_discovery:
+                        continue
+                    seen_discovery.add(href)
+                    link, classification = cls._normalize_link(
+                        href, final_url, allowed_domains, start_port
+                    )
+                    if classification == "unsafe":
+                        result.skipped_unsafe += 1
+                    elif classification == "out_of_scope":
+                        result.skipped_out_of_scope += 1
+                    elif link:
+                        if link not in normalized_links:
+                            normalized_links.append(link)
+                        if link not in enqueued:
+                            enqueued.add(link)
+                            button_discovered_total += 1
+                            if depth < max_depth:
+                                queue.append((link, depth + 1))
+                            else:
+                                depth_limited.add(link)
+                result.button_discovered_url_count += button_discovered_total
+
+                page_observation_payload = {
+                    **(observations.get("page", {}) if isinstance(observations, dict) else {}),
+                    "performance": observations.get("performance", {}) if isinstance(observations, dict) else {},
+                }
+                if explore_button_navigations:
+                    page_observation_payload["button_discovered_urls"] = button_discovered_total
+                    page_observation_payload["spa_routes_discovered"] = len(spa_routes)
+                    page_observation_payload["popup_urls_discovered"] = len(captured_popup_urls)
                 crawled_page = CrawledPage(
                     url=current_url,
                     final_url=final_url,
@@ -523,10 +770,7 @@ class SiteCrawler:
                     response_headers=headers,
                     cookies=cookies,
                     links=normalized_links,
-                    page_observations={
-                        **(observations.get("page", {}) if isinstance(observations, dict) else {}),
-                        "performance": observations.get("performance", {}) if isinstance(observations, dict) else {},
-                    },
+                    page_observations=page_observation_payload,
                     navigation_error=navigation_error,
                 )
                 result.pages.append(crawled_page)
@@ -535,8 +779,9 @@ class SiteCrawler:
                     continue_crawl = await page_callback(page, crawled_page)
                     if continue_crawl is False:
                         result.stopped_after_incomplete_page = True
-                        queue.clear()
-                    else:
+                        if not continue_on_incomplete_coverage:
+                            queue.clear()
+                    if continue_crawl is not False or continue_on_incomplete_coverage:
                         discovered_after_interaction = crawled_page.links[len(normalized_links):]
                         available_link_slots = max(0, max_links_per_page - len(normalized_links))
                         if len(discovered_after_interaction) > available_link_slots:

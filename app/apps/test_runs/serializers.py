@@ -39,6 +39,11 @@ class AdvancedExecutionOptions(BaseModel):
     timeout_seconds: int = 300          # Total scan timeout
     max_crawl_depth: int = 2            # Exploration depth
     include_sitemap_urls: bool = False  # Module scans follow links from the selected page only
+    max_pages: int = Field(default=100, ge=1, le=500)
+    traversal_strategy: Literal["bfs", "dfs"] = "bfs"
+    explore_button_navigations: bool = False
+    continue_on_incomplete_coverage: bool = True
+    per_page_time_budget_seconds: int = Field(default=0, ge=0, le=1800)
 
     # Deterministic interaction matrix controls
     exhaustive_interactions: bool = True
